@@ -282,9 +282,15 @@ fn run(args: &Args) -> Result<()> {
         .iter()
         .map(|s| s.text.as_str())
         .collect::<Vec<_>>()
-        .join("\n");
+        .join(" ");
 
+    println!();
+    println!("====================");
+    println!();
     println!("{}", transcript);
+    println!();
+    println!("====================");
+    println!();
 
     let mut clipboard = Clipboard::new()?;
     clipboard.set_text(transcript)?;
