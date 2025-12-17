@@ -1,7 +1,7 @@
 use clap::Parser;
 use eyre::Result;
 use hf_hub::api::sync::Api;
-use parakeet_rs::{ParakeetTDT, TimestampMode};
+use parakeet_rs::{ParakeetTDT, TimestampMode, Transcriber};
 use rubato::{FftFixedIn, Resampler};
 use std::fs::{self, File};
 use std::io::Read;
