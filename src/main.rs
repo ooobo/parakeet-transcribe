@@ -37,10 +37,15 @@ struct Args {
     /// Model quantization (int8 or none)
     #[arg(long, default_value = "int8")]
     quantization: String,
+
+    /// Include timestamps in output
+    #[arg(long)]
+    timestamps: bool,
 }
 
 struct Segment {
     text: String,
+    start_time: f32,
 }
 
 // ------------------------------------------------------------
@@ -220,6 +225,7 @@ fn transcribe(
             .into_iter()
             .map(|t| Segment {
                 text: clean_text(&t.text),
+                start_time: t.start,
             })
             .filter(|s| is_valid_segment(&s.text))
             .collect());
@@ -235,6 +241,7 @@ fn transcribe(
     while pos < audio.len() {
         let end = (pos + chunk_samples).min(audio.len());
         let chunk = audio[pos..end].to_vec();
+        let chunk_start_time = pos as f32 / SAMPLE_RATE as f32;
 
         let r =
             parakeet.transcribe_samples(chunk, SAMPLE_RATE, 1, Some(TimestampMode::Sentences))?;
@@ -242,7 +249,10 @@ fn transcribe(
         for t in r.tokens {
             let txt = clean_text(&t.text);
             if is_valid_segment(&txt) {
-                all.push(Segment { text: txt });
+                all.push(Segment {
+                    text: txt,
+                    start_time: chunk_start_time + t.start,
+                });
             }
         }
 
@@ -278,11 +288,23 @@ fn run(args: &Args) -> Result<()> {
     eprintln!("Transcribing...");
     let segments = transcribe(&mut model, audio, args.chunk_duration)?;
 
-    let transcript = segments
-        .iter()
-        .map(|s| s.text.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let transcript = if args.timestamps {
+        segments
+            .iter()
+            .map(|s| {
+                let minutes = (s.start_time / 60.0) as u32;
+                let seconds = (s.start_time % 60.0) as u32;
+                format!("[{:02}:{:02}] {}", minutes, seconds, s.text)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        segments
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
 
     println!();
     println!("====================");
