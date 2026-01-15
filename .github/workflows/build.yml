@@ -45,7 +45,7 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: |
           mkdir dist
-          copy target\release\parakeet-transcribe.exe dist\parakeet-transcribe-windows.exe
+          copy target\release\parakeet-transcribe.exe dist\parakeet-transcribe.exe
 
       - name: Rename binary (macOS)
         if: matrix.os == 'macos-latest'
