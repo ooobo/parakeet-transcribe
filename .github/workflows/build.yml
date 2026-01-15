@@ -41,11 +41,13 @@ jobs:
       - name: Build release
         run: cargo build --release
 
-      - name: Rename binary (Windows)
+      - name: Package Windows binary
         if: matrix.os == 'windows-latest'
         run: |
           mkdir dist
-          copy target\release\parakeet-transcribe.exe dist\parakeet-transcribe-windows.exe
+          copy target\release\parakeet-transcribe.exe dist\parakeet-transcribe.exe
+          copy transcribe-with-timestamps.bat dist\transcribe-with-timestamps.bat
+          powershell Compress-Archive -Path dist\* -DestinationPath parakeet-transcribe-windows.zip
 
       - name: Rename binary (macOS)
         if: matrix.os == 'macos-latest'
@@ -53,7 +55,15 @@ jobs:
           mkdir dist
           cp target/release/parakeet-transcribe dist/parakeet-transcribe-macos
 
-      - name: Upload artifact
+      - name: Upload artifact (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: parakeet-transcribe-${{ matrix.os }}
+          path: parakeet-transcribe-windows.zip
+
+      - name: Upload artifact (macOS)
+        if: matrix.os == 'macos-latest'
         uses: actions/upload-artifact@v4
         with:
           name: parakeet-transcribe-${{ matrix.os }}
