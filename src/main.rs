@@ -4,9 +4,11 @@ use hf_hub::api::sync::Api;
 use parakeet_rs::{ParakeetTDT, TimestampMode, Transcriber};
 use rubato::{FftFixedIn, Resampler};
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+mod mpeg_wav_reader;
 
 use arboard::Clipboard;
 use symphonia::core::audio::SampleBuffer;
@@ -112,6 +114,28 @@ fn ensure_model_files(model: &str, quantization: &str) -> Result<PathBuf> {
 // ------------------------------------------------------------
 
 fn load_audio_native(path: &Path) -> Result<Vec<f32>> {
+    // First, try to detect if this is an MPEG-in-WAV file (common in BWF files)
+    let mut file = File::open(path)?;
+    if let Some(mpeg_data) = mpeg_wav_reader::extract_mpeg_from_wav(&mut file)? {
+        eprintln!("Detected MPEG audio in WAV container, extracting...");
+        // Decode the MPEG data directly
+        let cursor = Cursor::new(mpeg_data);
+        let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
+
+        let mut hint = Hint::new();
+        hint.with_extension("mp3");
+
+        let probed = symphonia::default::get_probe().format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )?;
+
+        return decode_audio(probed);
+    }
+
+    // Standard audio file processing
     let file = File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -132,6 +156,11 @@ fn load_audio_native(path: &Path) -> Result<Vec<f32>> {
         &FormatOptions::default(),
         &MetadataOptions::default(),
     )?;
+
+    decode_audio(probed)
+}
+
+fn decode_audio(probed: symphonia::core::probe::ProbeResult) -> Result<Vec<f32>> {
 
     let mut format = probed.format;
     let track = format
