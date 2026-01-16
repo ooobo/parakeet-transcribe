@@ -117,7 +117,13 @@ fn load_audio_native(path: &Path) -> Result<Vec<f32>> {
 
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(ext);
+        // BWF (Broadcast Wave Format) files are WAV files with extra metadata
+        let format_ext = if ext.eq_ignore_ascii_case("bwf") {
+            "wav"
+        } else {
+            ext
+        };
+        hint.with_extension(format_ext);
     }
 
     let probed = symphonia::default::get_probe().format(
