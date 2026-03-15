@@ -374,10 +374,19 @@ fn merge_orphaned_punctuation(segments: &mut Vec<Segment>) {
 // Transcription
 // ------------------------------------------------------------
 
+/// Finalize a batch of segments: merge orphaned punctuation and clean text.
+fn finalize_segments(segments: &mut Vec<Segment>) {
+    merge_orphaned_punctuation(segments);
+    for seg in segments {
+        seg.text = clean_segment_text(&seg.text);
+    }
+}
+
 fn transcribe_with_chunking(
     parakeet: &mut ParakeetTDT,
     audio_samples: Vec<f32>,
     chunk_duration: f32,
+    mut on_segments: Option<&mut dyn FnMut(&[Segment])>,
 ) -> Result<Vec<Segment>> {
     let duration = audio_samples.len() as f32 / SAMPLE_RATE as f32;
 
@@ -409,6 +418,9 @@ fn transcribe_with_chunking(
     let mut all_segments: Vec<Segment> = Vec::new();
     let total_samples = audio_samples.len();
 
+    // Buffer one chunk's segments to handle cross-chunk orphaned punctuation
+    let mut buffered_segments: Vec<Segment> = Vec::new();
+
     let mut start = 0;
     let mut chunk_idx = 0;
 
@@ -417,15 +429,10 @@ fn transcribe_with_chunking(
         let chunk: Vec<f32> = audio_samples[start..end].to_vec();
         let chunk_start_time = start as f32 / SAMPLE_RATE as f32;
 
-        eprintln!(
-            "Processing chunk {} ({:.1}s - {:.1}s)...",
-            chunk_idx + 1,
-            chunk_start_time,
-            end as f32 / SAMPLE_RATE as f32
-        );
-
         let result =
             parakeet.transcribe_samples(chunk, SAMPLE_RATE, 1, Some(TimestampMode::Sentences))?;
+
+        let mut chunk_segments: Vec<Segment> = Vec::new();
 
         for token in result.tokens {
             let adjusted_start = token.start + chunk_start_time;
@@ -435,7 +442,7 @@ fn transcribe_with_chunking(
             if chunk_idx > 0 {
                 let overlap_end = chunk_start_time + OVERLAP_DURATION;
                 if adjusted_start < overlap_end {
-                    if let Some(last) = all_segments.last() {
+                    if let Some(last) = buffered_segments.last().or(all_segments.last()) {
                         if adjusted_start < last.end {
                             continue;
                         }
@@ -445,7 +452,7 @@ fn transcribe_with_chunking(
 
             let text = token.text;
             if !text.trim().is_empty() {
-                all_segments.push(Segment {
+                chunk_segments.push(Segment {
                     text,
                     start: adjusted_start,
                     end: adjusted_end,
@@ -453,12 +460,47 @@ fn transcribe_with_chunking(
             }
         }
 
+        if !buffered_segments.is_empty() {
+            // Merge orphaned punctuation at the boundary: check if the first
+            // new segment is just punctuation that belongs on the last buffered one
+            let mut combined = buffered_segments;
+            combined.append(&mut chunk_segments);
+            finalize_segments(&mut combined);
+
+            // Split back: the original buffered segments are now finalized
+            // Find the split point — segments whose start time is >= chunk_start_time
+            // belong to the new chunk (accounting for overlap dedup)
+            let split_idx = combined
+                .iter()
+                .position(|s| s.start >= chunk_start_time - OVERLAP_DURATION)
+                .unwrap_or(combined.len());
+
+            chunk_segments = combined.split_off(split_idx);
+            let finalized = combined;
+
+            if let Some(ref mut cb) = on_segments {
+                cb(&finalized);
+            }
+            all_segments.extend(finalized);
+        }
+
+        buffered_segments = chunk_segments;
+
         chunk_idx += 1;
         start += stride;
 
         if end >= total_samples {
             break;
         }
+    }
+
+    // Flush remaining buffered segments
+    if !buffered_segments.is_empty() {
+        finalize_segments(&mut buffered_segments);
+        if let Some(cb) = on_segments {
+            cb(&buffered_segments);
+        }
+        all_segments.extend(buffered_segments);
     }
 
     Ok(all_segments)
@@ -506,22 +548,66 @@ fn run(args: &Args) -> Result<()> {
         .wrap_err("Failed to load Parakeet TDT model")?;
 
     eprintln!("Transcribing...");
-    let mut segments = transcribe_with_chunking(&mut parakeet, audio_samples, args.chunk_duration)?;
 
-    // Clean up punctuation spacing artifacts from model tokenization
-    merge_orphaned_punctuation(&mut segments);
-    for seg in &mut segments {
-        seg.text = clean_segment_text(&seg.text);
+    let is_json = args.json;
+    let use_timestamps = args.timestamps;
+
+    // Build a streaming callback that outputs segments as they are finalized.
+    // For short files (single chunk) this won't be called — output happens after.
+    let mut stream_cb = |segments: &[Segment]| {
+        for seg in segments {
+            if is_json {
+                if let Ok(json) = serde_json::to_string(seg) {
+                    println!("{}", json);
+                }
+            } else if use_timestamps {
+                let minutes = (seg.start / 60.0) as u32;
+                let seconds = (seg.start % 60.0) as u32;
+                println!("[{:02}:{:02}] {}", minutes, seconds, seg.text);
+            } else {
+                println!("{}", seg.text);
+            }
+        }
+        let _ = std::io::stdout().flush();
+    };
+
+    let mut segments = transcribe_with_chunking(
+        &mut parakeet,
+        audio_samples,
+        args.chunk_duration,
+        Some(&mut stream_cb),
+    )?;
+
+    // For short files the callback isn't invoked, so finalize and output here
+    let was_chunked = duration > args.chunk_duration;
+
+    if !was_chunked {
+        // Short file: finalize segments now
+        finalize_segments(&mut segments);
+
+        if args.json {
+            for segment in &segments {
+                println!("{}", serde_json::to_string(segment)?);
+            }
+            std::io::stdout().flush()?;
+        } else if args.timestamps {
+            for seg in &segments {
+                let minutes = (seg.start / 60.0) as u32;
+                let seconds = (seg.start % 60.0) as u32;
+                println!("[{:02}:{:02}] {}", minutes, seconds, seg.text);
+            }
+        } else {
+            let transcript = segments
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("{}", transcript);
+        }
     }
 
-    if args.json {
-        // JSON lines output for scripting / reaspeech integration
-        for segment in &segments {
-            println!("{}", serde_json::to_string(segment)?);
-        }
-        std::io::stdout().flush()?;
-    } else {
-        // Human-readable text output for drag-and-drop use
+    if !args.json {
+        // Build full transcript for clipboard
         let transcript = if args.timestamps {
             segments
                 .iter()
@@ -539,14 +625,6 @@ fn run(args: &Args) -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-
-        println!();
-        println!("====================");
-        println!();
-        println!("{}", transcript);
-        println!();
-        println!("====================");
-        println!();
 
         match arboard::Clipboard::new() {
             Ok(mut clipboard) => {
