@@ -12,7 +12,7 @@ name = "parakeet-transcribe"
 path = "src/main.rs"
 
 [dependencies]
-parakeet-rs = "0.3.4"
+parakeet-rs = { version = "0.3.4", features = ["sortformer"] }
 clap = { version = "4.4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

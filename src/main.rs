@@ -1,6 +1,7 @@
 use clap::Parser;
 use eyre::{Context, Result};
 use hf_hub::api::sync::Api;
+use parakeet_rs::sortformer::{DiarizationConfig, Sortformer, SpeakerSegment};
 use parakeet_rs::{ParakeetTDT, TimestampMode, Transcriber};
 use rubato::{FftFixedIn, Resampler};
 use serde::Serialize;
@@ -46,6 +47,10 @@ struct Args {
     /// Include timestamps in text output (ignored with --json)
     #[arg(long)]
     timestamps: bool,
+
+    /// Enable speaker diarization (text output only, not supported with --json)
+    #[arg(long)]
+    diarize: bool,
 
     /// File to create when transcription is complete
     #[arg(long)]
@@ -144,6 +149,33 @@ fn ensure_model_files(model: &str, quantization: &str) -> Result<PathBuf> {
 
     eprintln!("Model files downloaded to {model_dir:?}");
     Ok(model_dir)
+}
+
+fn ensure_sortformer_model() -> Result<PathBuf> {
+    let model_dir = dirs::cache_dir()
+        .ok_or_else(|| eyre::eyre!("Could not find cache directory"))?
+        .join("parakeet-tdt")
+        .join("sortformer-v2.1");
+    fs::create_dir_all(&model_dir)?;
+
+    let model_path = model_dir.join("diar_streaming_sortformer_4spk-v2.1.onnx");
+
+    if model_path.exists() {
+        eprintln!("Using cached sortformer model from {model_dir:?}");
+        return Ok(model_path);
+    }
+
+    eprintln!("Downloading sortformer v2.1 model...");
+    let api = Api::new().wrap_err("Failed to create HuggingFace API client")?;
+    let repo = api.model("altunenes/parakeet-rs".to_string());
+
+    let src = repo
+        .get("diar_streaming_sortformer_4spk-v2.1.onnx")
+        .wrap_err("Failed to download sortformer model")?;
+    fs::copy(&src, &model_path).wrap_err("Failed to copy sortformer model")?;
+
+    eprintln!("Sortformer model downloaded to {model_dir:?}");
+    Ok(model_path)
 }
 
 // ------------------------------------------------------------
@@ -507,6 +539,65 @@ fn transcribe_with_chunking(
 }
 
 // ------------------------------------------------------------
+// Diarization helpers
+// ------------------------------------------------------------
+
+/// For each transcript segment, find the speaker with the most overlap.
+fn assign_speakers(segments: &[Segment], speaker_segments: &[SpeakerSegment]) -> Vec<Option<usize>> {
+    segments
+        .iter()
+        .map(|seg| {
+            speaker_segments
+                .iter()
+                .filter_map(|s| {
+                    let s_start = s.start as f32 / 16_000.0;
+                    let s_end = s.end as f32 / 16_000.0;
+                    let overlap_start = seg.start.max(s_start);
+                    let overlap_end = seg.end.min(s_end);
+                    let overlap = (overlap_end - overlap_start).max(0.0);
+                    if overlap > 0.0 {
+                        Some((s.speaker_id, overlap))
+                    } else {
+                        None
+                    }
+                })
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .map(|(id, _)| id)
+        })
+        .collect()
+}
+
+/// A speaker turn: one or more consecutive segments from the same speaker.
+struct SpeakerTurn {
+    text: String,
+    start: f32,
+}
+
+/// Group consecutive segments by speaker into turns.
+fn group_by_speaker(segments: &[Segment], speakers: &[Option<usize>]) -> Vec<SpeakerTurn> {
+    let mut turns: Vec<SpeakerTurn> = Vec::new();
+    let mut last_speaker: Option<usize> = None;
+
+    for (seg, speaker) in segments.iter().zip(speakers.iter()) {
+        if *speaker == last_speaker && speaker.is_some() {
+            if let Some(last_turn) = turns.last_mut() {
+                last_turn.text.push(' ');
+                last_turn.text.push_str(seg.text.trim());
+                continue;
+            }
+        }
+
+        last_speaker = *speaker;
+        turns.push(SpeakerTurn {
+            text: seg.text.trim().to_string(),
+            start: seg.start,
+        });
+    }
+
+    turns
+}
+
+// ------------------------------------------------------------
 // Main logic
 // ------------------------------------------------------------
 
@@ -516,6 +607,12 @@ fn run(args: &Args) -> Result<()> {
     let audio_path = Path::new(&args.audio_file);
     if !audio_path.exists() {
         return Err(eyre::eyre!("Audio file not found: {}", args.audio_file));
+    }
+
+    if args.diarize && args.json {
+        return Err(eyre::eyre!(
+            "--diarize is not supported with --json yet"
+        ));
     }
 
     // Validate quantization
@@ -543,6 +640,29 @@ fn run(args: &Args) -> Result<()> {
         audio_samples.len()
     );
 
+    // Run diarization before transcription if requested
+    let speaker_segments = if args.diarize {
+        eprintln!("Loading sortformer model...");
+        let sortformer_path = ensure_sortformer_model()
+            .wrap_err("Failed to download sortformer model")?;
+
+        let mut sortformer = Sortformer::with_config(
+            sortformer_path.to_str().unwrap(),
+            None,
+            DiarizationConfig::callhome(),
+        )
+        .wrap_err("Failed to load sortformer model")?;
+
+        eprintln!("Running speaker diarization...");
+        let segments = sortformer
+            .diarize(audio_samples.clone(), SAMPLE_RATE, 1)
+            .wrap_err("Diarization failed")?;
+        eprintln!("Found {} speaker segments", segments.len());
+        Some(segments)
+    } else {
+        None
+    };
+
     eprintln!("Loading model...");
     let mut parakeet = ParakeetTDT::from_pretrained(&model_dir, None)
         .wrap_err("Failed to load Parakeet TDT model")?;
@@ -551,10 +671,14 @@ fn run(args: &Args) -> Result<()> {
 
     let is_json = args.json;
     let use_timestamps = args.timestamps;
+    let use_diarize = args.diarize;
 
-    // Build a streaming callback that outputs segments as they are finalized.
-    // For short files (single chunk) this won't be called — output happens after.
+    // When diarizing, we need all segments before outputting (to match speakers).
+    // Use streaming callback only when NOT diarizing.
     let mut stream_cb = |segments: &[Segment]| {
+        if use_diarize {
+            return; // Skip streaming output; we'll output after speaker matching
+        }
         for seg in segments {
             if is_json {
                 if let Ok(json) = serde_json::to_string(seg) {
@@ -581,11 +705,54 @@ fn run(args: &Args) -> Result<()> {
     // For short files the callback isn't invoked, so finalize and output here
     let was_chunked = duration > args.chunk_duration;
 
-    if !was_chunked {
-        // Short file: finalize segments now
-        finalize_segments(&mut segments);
+    if !was_chunked || args.diarize {
+        if !was_chunked {
+            finalize_segments(&mut segments);
+        }
 
-        if args.json {
+        if args.diarize {
+            // Match speakers and group into turns
+            let speaker_segs = speaker_segments.as_ref().unwrap();
+            let speakers = assign_speakers(&segments, speaker_segs);
+            let turns = group_by_speaker(&segments, &speakers);
+
+            for turn in &turns {
+                if use_timestamps {
+                    let minutes = (turn.start / 60.0) as u32;
+                    let seconds = (turn.start % 60.0) as u32;
+                    println!("[{}:{:02}] - {}", minutes, seconds, turn.text);
+                } else {
+                    println!("- {}", turn.text);
+                }
+            }
+
+            // Clipboard
+            let transcript = turns
+                .iter()
+                .map(|t| {
+                    if use_timestamps {
+                        let minutes = (t.start / 60.0) as u32;
+                        let seconds = (t.start % 60.0) as u32;
+                        format!("[{}:{:02}] - {}", minutes, seconds, t.text)
+                    } else {
+                        format!("- {}", t.text)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            match arboard::Clipboard::new() {
+                Ok(mut clipboard) => {
+                    if let Err(e) = clipboard.set_text(&transcript) {
+                        eprintln!("Warning: could not copy to clipboard: {}", e);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Warning: could not access clipboard: {}", e);
+                }
+            }
+            eprintln!("Transcript copied to clipboard.");
+        } else if args.json {
             for segment in &segments {
                 println!("{}", serde_json::to_string(segment)?);
             }
@@ -606,7 +773,7 @@ fn run(args: &Args) -> Result<()> {
         }
     }
 
-    if !args.json {
+    if !args.json && !args.diarize {
         // Build full transcript for clipboard
         let transcript = if args.timestamps {
             segments
