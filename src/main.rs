@@ -429,13 +429,6 @@ fn transcribe_with_chunking(
         let chunk: Vec<f32> = audio_samples[start..end].to_vec();
         let chunk_start_time = start as f32 / SAMPLE_RATE as f32;
 
-        eprintln!(
-            "Processing chunk {} ({:.1}s - {:.1}s)...",
-            chunk_idx + 1,
-            chunk_start_time,
-            end as f32 / SAMPLE_RATE as f32
-        );
-
         let result =
             parakeet.transcribe_samples(chunk, SAMPLE_RATE, 1, Some(TimestampMode::Sentences))?;
 
