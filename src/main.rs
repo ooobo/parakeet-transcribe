@@ -327,6 +327,50 @@ fn resample_audio(samples: &[f32], source_rate: u32, target_rate: u32) -> Result
 }
 
 // ------------------------------------------------------------
+// Text cleanup
+// ------------------------------------------------------------
+
+/// Fix punctuation spacing artifacts from the model's tokenization.
+/// The model sometimes separates periods and commas from adjacent text,
+/// producing "D .C ." instead of "D.C." and "$30 ,000" instead of "$30,000".
+fn clean_segment_text(text: &str) -> String {
+    let mut chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i + 2 < chars.len() {
+        if chars[i] == ' ' {
+            // Space before period followed by a letter: " .C" → ".C"
+            if chars[i + 1] == '.' && chars.get(i + 2).map_or(false, |c| c.is_alphabetic()) {
+                chars.remove(i);
+                continue;
+            }
+            // Space before comma followed by a digit: " ,000" → ",000"
+            if chars[i + 1] == ',' && chars.get(i + 2).map_or(false, |c| c.is_ascii_digit()) {
+                chars.remove(i);
+                continue;
+            }
+        }
+        i += 1;
+    }
+    chars.into_iter().collect()
+}
+
+/// Merge orphaned punctuation-only segments into the previous segment's text.
+fn merge_orphaned_punctuation(segments: &mut Vec<Segment>) {
+    let mut i = 1;
+    while i < segments.len() {
+        let trimmed = segments[i].text.trim().to_string();
+        if trimmed.len() <= 2 && trimmed.chars().all(|c| c.is_ascii_punctuation()) {
+            // Append to previous segment
+            segments[i - 1].text.push_str(&trimmed);
+            segments[i - 1].end = segments[i].end;
+            segments.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+// ------------------------------------------------------------
 // Transcription
 // ------------------------------------------------------------
 
@@ -462,7 +506,13 @@ fn run(args: &Args) -> Result<()> {
         .wrap_err("Failed to load Parakeet TDT model")?;
 
     eprintln!("Transcribing...");
-    let segments = transcribe_with_chunking(&mut parakeet, audio_samples, args.chunk_duration)?;
+    let mut segments = transcribe_with_chunking(&mut parakeet, audio_samples, args.chunk_duration)?;
+
+    // Clean up punctuation spacing artifacts from model tokenization
+    merge_orphaned_punctuation(&mut segments);
+    for seg in &mut segments {
+        seg.text = clean_segment_text(&seg.text);
+    }
 
     if args.json {
         // JSON lines output for scripting / reaspeech integration
@@ -547,5 +597,47 @@ fn main() {
 
     if !is_json {
         wait_for_keypress();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clean_initials() {
+        // The trailing "." comes as a separate segment (handled by merge_orphaned_punctuation)
+        assert_eq!(clean_segment_text("Washington, D .C"), "Washington, D.C");
+        assert_eq!(clean_segment_text("the U .S .A"), "the U.S.A");
+    }
+
+    #[test]
+    fn test_clean_digit_separator() {
+        assert_eq!(clean_segment_text("$30 ,000 difference"), "$30,000 difference");
+        assert_eq!(clean_segment_text("$1 ,000 ,000"), "$1,000,000");
+    }
+
+    #[test]
+    fn test_clean_no_false_positives() {
+        // Space before period at end of sentence should stay
+        assert_eq!(clean_segment_text("end of sentence ."), "end of sentence .");
+        // Space before comma followed by a word should stay
+        assert_eq!(clean_segment_text("hello , world"), "hello , world");
+        // Normal text unchanged
+        assert_eq!(clean_segment_text("hello world"), "hello world");
+    }
+
+    #[test]
+    fn test_merge_orphaned_punctuation() {
+        let mut segments = vec![
+            Segment { text: "Washington, D.C".to_string(), start: 0.0, end: 1.0 },
+            Segment { text: ".".to_string(), start: 1.0, end: 1.1 },
+            Segment { text: "Next sentence.".to_string(), start: 1.1, end: 2.0 },
+        ];
+        merge_orphaned_punctuation(&mut segments);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].text, "Washington, D.C.");
+        assert_eq!(segments[0].end, 1.1);
+        assert_eq!(segments[1].text, "Next sentence.");
     }
 }
