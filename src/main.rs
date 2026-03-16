@@ -598,6 +598,42 @@ fn print_turn(turn: &SpeakerTurn, timestamps: bool) {
     println!("{}", format_turn(turn, timestamps));
 }
 
+/// Messages sent through the unified pipeline channel during diarization.
+enum PipelineMsg {
+    TranscriptBatch(Vec<Segment>),
+    SpeakersDone(Vec<SpeakerSegment>),
+}
+
+/// Process a batch of transcript segments: assign speakers and group into turns.
+/// Flushes completed turns to stdout as speaker changes are detected.
+fn process_diarized_batch(
+    batch: &[Segment],
+    speaker_segs: &[SpeakerSegment],
+    last_speaker: &mut Option<usize>,
+    pending_turn: &mut Option<SpeakerTurn>,
+    turns: &mut Vec<SpeakerTurn>,
+    timestamps: bool,
+) {
+    let speakers = assign_speakers(batch, speaker_segs);
+    for (seg, speaker) in batch.iter().zip(speakers.iter()) {
+        if *speaker == *last_speaker && speaker.is_some() {
+            if let Some(ref mut turn) = *pending_turn {
+                turn.text.push(' ');
+                turn.text.push_str(seg.text.trim());
+            }
+        } else {
+            if let Some(turn) = pending_turn.take() {
+                print_turn(&turn, timestamps);
+                turns.push(turn);
+            }
+            *last_speaker = *speaker;
+            *pending_turn = Some(SpeakerTurn {
+                text: seg.text.trim().to_string(),
+                start: seg.start,
+            });
+        }
+    }
+}
 
 // ------------------------------------------------------------
 // Main logic
@@ -661,13 +697,14 @@ fn run(args: &Args) -> Result<()> {
         // diarization runs concurrently. Once diarization finishes, the main
         // thread starts consuming batches and printing speaker turns.
         let audio_for_diarize = audio_samples.clone();
-        let (tx, rx) = mpsc::channel::<Vec<Segment>>();
+        let (tx, rx) = mpsc::channel::<PipelineMsg>();
+        let tx_diarize = tx.clone();
         let half_threads = (total_threads / 2).max(1);
 
         status!(debug, "Running diarization and transcription in parallel...");
 
         let completed_turns: Vec<SpeakerTurn> = std::thread::scope(|s| -> Result<Vec<SpeakerTurn>> {
-            let diarize_handle = s.spawn(|| -> Result<Vec<SpeakerSegment>> {
+            let diarize_handle = s.spawn(|| -> Result<()> {
                 status!(debug, "Loading sortformer model...");
                 let sortformer_path = ensure_sortformer_model(debug)
                     .wrap_err("Failed to download sortformer model")?;
@@ -685,9 +722,13 @@ fn run(args: &Args) -> Result<()> {
                     .diarize(audio_for_diarize, SAMPLE_RATE, 1)
                     .wrap_err("Diarization failed")?;
                 status!(debug, "Found {} speaker segments", segs.len());
-                Ok(segs)
+                let _ = tx_diarize.send(PipelineMsg::SpeakersDone(segs));
+                Ok(())
             });
 
+            // tx (the original sender) is moved into the transcribe thread;
+            // tx_diarize (the clone) is moved into the diarize thread above.
+            // When both threads finish, all senders are dropped → channel closes.
             let transcribe_handle = s.spawn(move || -> Result<()> {
                 status!(debug, "Loading model...");
                 let exec_config = ExecutionConfig::new().with_intra_threads(half_threads);
@@ -696,7 +737,7 @@ fn run(args: &Args) -> Result<()> {
 
                 status!(debug, "Transcribing...");
                 let mut cb = |segments: &[Segment]| {
-                    let _ = tx.send(segments.to_vec());
+                    let _ = tx.send(PipelineMsg::TranscriptBatch(segments.to_vec()));
                 };
                 let mut segments = transcribe_with_chunking(
                     &mut parakeet,
@@ -709,45 +750,47 @@ fn run(args: &Args) -> Result<()> {
                 let was_chunked = duration > chunk_duration;
                 if !was_chunked {
                     finalize_segments(&mut segments);
-                    let _ = tx.send(segments);
+                    let _ = tx.send(PipelineMsg::TranscriptBatch(segments));
                 }
-                // tx drops here, closing the channel
                 Ok(())
             });
 
-            // Wait for diarization to finish so we have speaker segments
-            let speaker_segs = diarize_handle
-                .join()
-                .map_err(|_| eyre::eyre!("Diarization thread panicked"))??;
-
-            // Consume transcription batches as they arrive, assigning speakers
-            // and streaming turns incrementally
+            // Consume the unified channel. Buffer transcript batches until
+            // diarization finishes, then flush and switch to streaming mode.
+            let mut speaker_segs: Option<Vec<SpeakerSegment>> = None;
+            let mut buffered_batches: Vec<Vec<Segment>> = Vec::new();
             let mut last_speaker: Option<usize> = None;
             let mut pending_turn: Option<SpeakerTurn> = None;
             let mut turns: Vec<SpeakerTurn> = Vec::new();
 
-            for batch in rx {
-                let speakers = assign_speakers(&batch, &speaker_segs);
-                for (seg, speaker) in batch.iter().zip(speakers.iter()) {
-                    if *speaker == last_speaker && speaker.is_some() {
-                        if let Some(ref mut turn) = pending_turn {
-                            turn.text.push(' ');
-                            turn.text.push_str(seg.text.trim());
+            for msg in rx {
+                match msg {
+                    PipelineMsg::TranscriptBatch(batch) => {
+                        if let Some(ref spk) = speaker_segs {
+                            // Streaming mode: process and print immediately
+                            process_diarized_batch(
+                                &batch, spk, &mut last_speaker,
+                                &mut pending_turn, &mut turns, use_timestamps,
+                            );
+                            let _ = std::io::stdout().flush();
+                        } else {
+                            // Buffer until diarization finishes
+                            buffered_batches.push(batch);
                         }
-                    } else {
-                        // Speaker changed — flush previous turn
-                        if let Some(turn) = pending_turn.take() {
-                            print_turn(&turn, use_timestamps);
-                            turns.push(turn);
+                    }
+                    PipelineMsg::SpeakersDone(segs) => {
+                        speaker_segs = Some(segs);
+                        // Flush all buffered batches now that we have speakers
+                        let spk = speaker_segs.as_ref().unwrap();
+                        for batch in buffered_batches.drain(..) {
+                            process_diarized_batch(
+                                &batch, spk, &mut last_speaker,
+                                &mut pending_turn, &mut turns, use_timestamps,
+                            );
                         }
-                        last_speaker = *speaker;
-                        pending_turn = Some(SpeakerTurn {
-                            text: seg.text.trim().to_string(),
-                            start: seg.start,
-                        });
+                        let _ = std::io::stdout().flush();
                     }
                 }
-                let _ = std::io::stdout().flush();
             }
 
             // Flush the last pending turn
@@ -756,7 +799,10 @@ fn run(args: &Args) -> Result<()> {
                 turns.push(turn);
             }
 
-            // Wait for transcription thread to finish
+            // Check for thread errors
+            diarize_handle
+                .join()
+                .map_err(|_| eyre::eyre!("Diarization thread panicked"))??;
             transcribe_handle
                 .join()
                 .map_err(|_| eyre::eyre!("Transcription thread panicked"))??;
