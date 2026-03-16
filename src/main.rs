@@ -2,7 +2,7 @@ use clap::Parser;
 use eyre::{Context, Result};
 use hf_hub::api::sync::Api;
 use parakeet_rs::sortformer::{DiarizationConfig, Sortformer, SpeakerSegment};
-use parakeet_rs::{ParakeetTDT, TimestampMode, Transcriber};
+use parakeet_rs::{ExecutionConfig, ParakeetTDT, TimestampMode, Transcriber};
 use rubato::{FftFixedIn, Resampler};
 use serde::Serialize;
 use std::fs::{self, File};
@@ -658,10 +658,15 @@ fn run(args: &Args) -> Result<()> {
     let use_timestamps = args.timestamps;
     let chunk_duration = args.chunk_duration;
 
+    let total_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
     // When diarizing, run diarization and transcription in parallel to cut wall time.
     // When not diarizing, run transcription with streaming output.
     let (speaker_segments, mut segments) = if args.diarize {
         let audio_for_diarize = audio_samples.clone();
+        let half_threads = (total_threads / 2).max(1);
 
         status!(debug, "Running diarization and transcription in parallel...");
 
@@ -672,12 +677,20 @@ fn run(args: &Args) -> Result<()> {
                     let sortformer_path = ensure_sortformer_model(debug)
                         .wrap_err("Failed to download sortformer model")?;
 
+                    let exec_config = ExecutionConfig::new()
+                        .with_intra_threads(half_threads);
                     let mut sortformer = Sortformer::with_config(
                         sortformer_path.to_str().unwrap(),
-                        None,
+                        Some(exec_config),
                         DiarizationConfig::callhome(),
                     )
                     .wrap_err("Failed to load sortformer model")?;
+
+                    // Use smaller chunks for faster inference — halves the input
+                    // size per ONNX call (attention is quadratic in chunk size)
+                    sortformer.chunk_len = 62;
+                    sortformer.fifo_len = 62;
+                    sortformer.spkcache_len = 94;
 
                     status!(debug, "Running speaker diarization...");
                     let segs = sortformer
@@ -689,7 +702,9 @@ fn run(args: &Args) -> Result<()> {
 
                 let transcribe_handle = s.spawn(|| -> Result<Vec<Segment>> {
                     status!(debug, "Loading model...");
-                    let mut parakeet = ParakeetTDT::from_pretrained(&model_dir, None)
+                    let exec_config = ExecutionConfig::new()
+                        .with_intra_threads(half_threads);
+                    let mut parakeet = ParakeetTDT::from_pretrained(&model_dir, Some(exec_config))
                         .wrap_err("Failed to load Parakeet TDT model")?;
 
                     status!(debug, "Transcribing...");
@@ -715,7 +730,8 @@ fn run(args: &Args) -> Result<()> {
         (Some(speaker_segs), transcript_segs)
     } else {
         status!(debug, "Loading model...");
-        let mut parakeet = ParakeetTDT::from_pretrained(&model_dir, None)
+        let exec_config = ExecutionConfig::new().with_intra_threads(total_threads);
+        let mut parakeet = ParakeetTDT::from_pretrained(&model_dir, Some(exec_config))
             .wrap_err("Failed to load Parakeet TDT model")?;
 
         status!(debug, "Transcribing...");
