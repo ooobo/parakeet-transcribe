@@ -2,12 +2,11 @@ use clap::Parser;
 use eyre::{Context, Result};
 use hf_hub::api::sync::Api;
 use parakeet_rs::sortformer::{DiarizationConfig, Sortformer, SpeakerSegment};
-use parakeet_rs::{ExecutionConfig, ParakeetTDT, TimestampMode, Transcriber};
+use parakeet_rs::{ParakeetTDT, TimestampMode, Transcriber};
 use rubato::{FftFixedIn, Resampler};
 use serde::Serialize;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
-use std::sync::mpsc;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use symphonia::core::audio::SampleBuffer;
@@ -68,7 +67,7 @@ struct Args {
     completion_marker: Option<String>,
 }
 
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Debug)]
 struct Segment {
     text: String,
     start: f32,
@@ -584,55 +583,28 @@ struct SpeakerTurn {
     start: f32,
 }
 
-fn format_turn(turn: &SpeakerTurn, timestamps: bool) -> String {
-    if timestamps {
-        let m = (turn.start / 60.0) as u32;
-        let s = (turn.start % 60.0) as u32;
-        format!("[{}:{:02}] - {}", m, s, turn.text)
-    } else {
-        format!("- {}", turn.text)
-    }
-}
+/// Group consecutive segments by speaker into turns.
+fn group_by_speaker(segments: &[Segment], speakers: &[Option<usize>]) -> Vec<SpeakerTurn> {
+    let mut turns: Vec<SpeakerTurn> = Vec::new();
+    let mut last_speaker: Option<usize> = None;
 
-fn print_turn(turn: &SpeakerTurn, timestamps: bool) {
-    println!("{}", format_turn(turn, timestamps));
-}
-
-/// Messages sent through the unified pipeline channel during diarization.
-enum PipelineMsg {
-    TranscriptBatch(Vec<Segment>),
-    SpeakersDone(Vec<SpeakerSegment>),
-}
-
-/// Process a batch of transcript segments: assign speakers and group into turns.
-/// Flushes completed turns to stdout as speaker changes are detected.
-fn process_diarized_batch(
-    batch: &[Segment],
-    speaker_segs: &[SpeakerSegment],
-    last_speaker: &mut Option<usize>,
-    pending_turn: &mut Option<SpeakerTurn>,
-    turns: &mut Vec<SpeakerTurn>,
-    timestamps: bool,
-) {
-    let speakers = assign_speakers(batch, speaker_segs);
-    for (seg, speaker) in batch.iter().zip(speakers.iter()) {
-        if *speaker == *last_speaker && speaker.is_some() {
-            if let Some(ref mut turn) = *pending_turn {
-                turn.text.push(' ');
-                turn.text.push_str(seg.text.trim());
+    for (seg, speaker) in segments.iter().zip(speakers.iter()) {
+        if *speaker == last_speaker && speaker.is_some() {
+            if let Some(last_turn) = turns.last_mut() {
+                last_turn.text.push(' ');
+                last_turn.text.push_str(seg.text.trim());
+                continue;
             }
-        } else {
-            if let Some(turn) = pending_turn.take() {
-                print_turn(&turn, timestamps);
-                turns.push(turn);
-            }
-            *last_speaker = *speaker;
-            *pending_turn = Some(SpeakerTurn {
-                text: seg.text.trim().to_string(),
-                start: seg.start,
-            });
         }
+
+        last_speaker = *speaker;
+        turns.push(SpeakerTurn {
+            text: seg.text.trim().to_string(),
+            start: seg.start,
+        });
     }
+
+    turns
 }
 
 // ------------------------------------------------------------
@@ -686,153 +658,64 @@ fn run(args: &Args) -> Result<()> {
     let use_timestamps = args.timestamps;
     let chunk_duration = args.chunk_duration;
 
-    let total_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-
-    if args.diarize {
-        // Run diarization and transcription in parallel, streaming diarized
-        // output as transcription chunks arrive. The channel lets the
-        // transcription thread send finalized segment batches while
-        // diarization runs concurrently. Once diarization finishes, the main
-        // thread starts consuming batches and printing speaker turns.
+    // When diarizing, run diarization and transcription in parallel to cut wall time.
+    // When not diarizing, run transcription with streaming output.
+    let (speaker_segments, mut segments) = if args.diarize {
         let audio_for_diarize = audio_samples.clone();
-        let (tx, rx) = mpsc::channel::<PipelineMsg>();
-        let tx_diarize = tx.clone();
-        let half_threads = (total_threads / 2).max(1);
 
         status!(debug, "Running diarization and transcription in parallel...");
 
-        let completed_turns: Vec<SpeakerTurn> = std::thread::scope(|s| -> Result<Vec<SpeakerTurn>> {
-            let diarize_handle = s.spawn(|| -> Result<()> {
-                status!(debug, "Loading sortformer model...");
-                let sortformer_path = ensure_sortformer_model(debug)
-                    .wrap_err("Failed to download sortformer model")?;
+        let result: Result<(Vec<SpeakerSegment>, Vec<Segment>)> =
+            std::thread::scope(|s| {
+                let diarize_handle = s.spawn(|| -> Result<Vec<SpeakerSegment>> {
+                    status!(debug, "Loading sortformer model...");
+                    let sortformer_path = ensure_sortformer_model(debug)
+                        .wrap_err("Failed to download sortformer model")?;
 
-                let exec_config = ExecutionConfig::new().with_intra_threads(half_threads);
-                let mut sortformer = Sortformer::with_config(
-                    sortformer_path.to_str().unwrap(),
-                    Some(exec_config),
-                    DiarizationConfig::callhome(),
-                )
-                .wrap_err("Failed to load sortformer model")?;
+                    let mut sortformer = Sortformer::with_config(
+                        sortformer_path.to_str().unwrap(),
+                        None,
+                        DiarizationConfig::callhome(),
+                    )
+                    .wrap_err("Failed to load sortformer model")?;
 
-                status!(debug, "Running speaker diarization...");
-                let segs = sortformer
-                    .diarize(audio_for_diarize, SAMPLE_RATE, 1)
-                    .wrap_err("Diarization failed")?;
-                status!(debug, "Found {} speaker segments", segs.len());
-                let _ = tx_diarize.send(PipelineMsg::SpeakersDone(segs));
-                Ok(())
+                    status!(debug, "Running speaker diarization...");
+                    let segs = sortformer
+                        .diarize(audio_for_diarize, SAMPLE_RATE, 1)
+                        .wrap_err("Diarization failed")?;
+                    status!(debug, "Found {} speaker segments", segs.len());
+                    Ok(segs)
+                });
+
+                let transcribe_handle = s.spawn(|| -> Result<Vec<Segment>> {
+                    status!(debug, "Loading model...");
+                    let mut parakeet = ParakeetTDT::from_pretrained(&model_dir, None)
+                        .wrap_err("Failed to load Parakeet TDT model")?;
+
+                    status!(debug, "Transcribing...");
+                    transcribe_with_chunking(
+                        &mut parakeet,
+                        audio_samples,
+                        chunk_duration,
+                        None,
+                    )
+                });
+
+                let speaker_segs = diarize_handle
+                    .join()
+                    .map_err(|_| eyre::eyre!("Diarization thread panicked"))??;
+                let transcript_segs = transcribe_handle
+                    .join()
+                    .map_err(|_| eyre::eyre!("Transcription thread panicked"))??;
+
+                Ok((speaker_segs, transcript_segs))
             });
 
-            // tx (the original sender) is moved into the transcribe thread;
-            // tx_diarize (the clone) is moved into the diarize thread above.
-            // When both threads finish, all senders are dropped → channel closes.
-            let transcribe_handle = s.spawn(move || -> Result<()> {
-                status!(debug, "Loading model...");
-                let exec_config = ExecutionConfig::new().with_intra_threads(half_threads);
-                let mut parakeet = ParakeetTDT::from_pretrained(&model_dir, Some(exec_config))
-                    .wrap_err("Failed to load Parakeet TDT model")?;
-
-                status!(debug, "Transcribing...");
-                let mut cb = |segments: &[Segment]| {
-                    let _ = tx.send(PipelineMsg::TranscriptBatch(segments.to_vec()));
-                };
-                let mut segments = transcribe_with_chunking(
-                    &mut parakeet,
-                    audio_samples,
-                    chunk_duration,
-                    Some(&mut cb),
-                )?;
-
-                // For short files the callback is never invoked; send all segments now
-                let was_chunked = duration > chunk_duration;
-                if !was_chunked {
-                    finalize_segments(&mut segments);
-                    let _ = tx.send(PipelineMsg::TranscriptBatch(segments));
-                }
-                Ok(())
-            });
-
-            // Consume the unified channel. Buffer transcript batches until
-            // diarization finishes, then flush and switch to streaming mode.
-            let mut speaker_segs: Option<Vec<SpeakerSegment>> = None;
-            let mut buffered_batches: Vec<Vec<Segment>> = Vec::new();
-            let mut last_speaker: Option<usize> = None;
-            let mut pending_turn: Option<SpeakerTurn> = None;
-            let mut turns: Vec<SpeakerTurn> = Vec::new();
-
-            for msg in rx {
-                match msg {
-                    PipelineMsg::TranscriptBatch(batch) => {
-                        if let Some(ref spk) = speaker_segs {
-                            // Streaming mode: process and print immediately
-                            process_diarized_batch(
-                                &batch, spk, &mut last_speaker,
-                                &mut pending_turn, &mut turns, use_timestamps,
-                            );
-                            let _ = std::io::stdout().flush();
-                        } else {
-                            // Buffer until diarization finishes
-                            buffered_batches.push(batch);
-                        }
-                    }
-                    PipelineMsg::SpeakersDone(segs) => {
-                        speaker_segs = Some(segs);
-                        // Flush all buffered batches now that we have speakers
-                        let spk = speaker_segs.as_ref().unwrap();
-                        for batch in buffered_batches.drain(..) {
-                            process_diarized_batch(
-                                &batch, spk, &mut last_speaker,
-                                &mut pending_turn, &mut turns, use_timestamps,
-                            );
-                        }
-                        let _ = std::io::stdout().flush();
-                    }
-                }
-            }
-
-            // Flush the last pending turn
-            if let Some(turn) = pending_turn.take() {
-                print_turn(&turn, use_timestamps);
-                turns.push(turn);
-            }
-
-            // Check for thread errors
-            diarize_handle
-                .join()
-                .map_err(|_| eyre::eyre!("Diarization thread panicked"))??;
-            transcribe_handle
-                .join()
-                .map_err(|_| eyre::eyre!("Transcription thread panicked"))??;
-
-            Ok(turns)
-        })?;
-
-        // Clipboard
-        let transcript = completed_turns
-            .iter()
-            .map(|t| format_turn(t, use_timestamps))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        match arboard::Clipboard::new() {
-            Ok(mut clipboard) => {
-                if let Err(e) = clipboard.set_text(&transcript) {
-                    eprintln!("Warning: could not copy to clipboard: {}", e);
-                }
-            }
-            Err(e) => {
-                eprintln!("Warning: could not access clipboard: {}", e);
-            }
-        }
-        status!(debug, "Transcript copied to clipboard.");
+        let (speaker_segs, transcript_segs) = result?;
+        (Some(speaker_segs), transcript_segs)
     } else {
-        // Non-diarize path: stream transcription output directly
         status!(debug, "Loading model...");
-        let exec_config = ExecutionConfig::new().with_intra_threads(total_threads);
-        let mut parakeet = ParakeetTDT::from_pretrained(&model_dir, Some(exec_config))
+        let mut parakeet = ParakeetTDT::from_pretrained(&model_dir, None)
             .wrap_err("Failed to load Parakeet TDT model")?;
 
         status!(debug, "Transcribing...");
@@ -854,57 +737,54 @@ fn run(args: &Args) -> Result<()> {
             let _ = std::io::stdout().flush();
         };
 
-        let mut segments = transcribe_with_chunking(
+        let segs = transcribe_with_chunking(
             &mut parakeet,
             audio_samples,
-            args.chunk_duration,
+            chunk_duration,
             Some(&mut stream_cb),
         )?;
 
-        // For short files the callback isn't invoked, so finalize and output here
-        let was_chunked = duration > args.chunk_duration;
+        (None, segs)
+    };
+
+    // For short files the callback isn't invoked, so finalize and output here
+    let was_chunked = duration > args.chunk_duration;
+
+    if !was_chunked || args.diarize {
         if !was_chunked {
             finalize_segments(&mut segments);
-            if args.json {
-                for segment in &segments {
-                    println!("{}", serde_json::to_string(segment)?);
-                }
-                std::io::stdout().flush()?;
-            } else if args.timestamps {
-                for seg in &segments {
-                    let minutes = (seg.start / 60.0) as u32;
-                    let seconds = (seg.start % 60.0) as u32;
-                    println!("[{:02}:{:02}] {}", minutes, seconds, seg.text);
-                }
-            } else {
-                let transcript = segments
-                    .iter()
-                    .map(|s| s.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                println!("{}", transcript);
-            }
         }
 
-        // Clipboard (non-json, non-diarize)
-        if !args.json {
-            let transcript = if args.timestamps {
-                segments
-                    .iter()
-                    .map(|s| {
-                        let minutes = (s.start / 60.0) as u32;
-                        let seconds = (s.start % 60.0) as u32;
-                        format!("[{:02}:{:02}] {}", minutes, seconds, s.text)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            } else {
-                segments
-                    .iter()
-                    .map(|s| s.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            };
+        if args.diarize {
+            // Match speakers and group into turns
+            let speaker_segs = speaker_segments.as_ref().unwrap();
+            let speakers = assign_speakers(&segments, speaker_segs);
+            let turns = group_by_speaker(&segments, &speakers);
+
+            for turn in &turns {
+                if use_timestamps {
+                    let minutes = (turn.start / 60.0) as u32;
+                    let seconds = (turn.start % 60.0) as u32;
+                    println!("[{}:{:02}] - {}", minutes, seconds, turn.text);
+                } else {
+                    println!("- {}", turn.text);
+                }
+            }
+
+            // Clipboard
+            let transcript = turns
+                .iter()
+                .map(|t| {
+                    if use_timestamps {
+                        let minutes = (t.start / 60.0) as u32;
+                        let seconds = (t.start % 60.0) as u32;
+                        format!("[{}:{:02}] - {}", minutes, seconds, t.text)
+                    } else {
+                        format!("- {}", t.text)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
 
             match arboard::Clipboard::new() {
                 Ok(mut clipboard) => {
@@ -917,7 +797,59 @@ fn run(args: &Args) -> Result<()> {
                 }
             }
             status!(debug, "Transcript copied to clipboard.");
+        } else if args.json {
+            for segment in &segments {
+                println!("{}", serde_json::to_string(segment)?);
+            }
+            std::io::stdout().flush()?;
+        } else if args.timestamps {
+            for seg in &segments {
+                let minutes = (seg.start / 60.0) as u32;
+                let seconds = (seg.start % 60.0) as u32;
+                println!("[{:02}:{:02}] {}", minutes, seconds, seg.text);
+            }
+        } else {
+            let transcript = segments
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("{}", transcript);
         }
+    }
+
+    if !args.json && !args.diarize {
+        // Build full transcript for clipboard
+        let transcript = if args.timestamps {
+            segments
+                .iter()
+                .map(|s| {
+                    let minutes = (s.start / 60.0) as u32;
+                    let seconds = (s.start % 60.0) as u32;
+                    format!("[{:02}:{:02}] {}", minutes, seconds, s.text)
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            segments
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+
+        match arboard::Clipboard::new() {
+            Ok(mut clipboard) => {
+                if let Err(e) = clipboard.set_text(&transcript) {
+                    eprintln!("Warning: could not copy to clipboard: {}", e);
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: could not access clipboard: {}", e);
+            }
+        }
+
+        status!(debug, "Transcript copied to clipboard.");
     }
 
     status!(
