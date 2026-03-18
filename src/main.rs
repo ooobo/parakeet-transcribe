@@ -4,9 +4,9 @@ use hf_hub::api::sync::Api;
 use parakeet_rs::sortformer::{DiarizationConfig, Sortformer, SpeakerSegment};
 use parakeet_rs::{ExecutionConfig, ParakeetTDT, TimestampMode, Transcriber};
 use rubato::{FftFixedIn, Resampler};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::{Cursor, Read, Write};
+use std::io::{BufRead, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use symphonia::core::audio::SampleBuffer;
@@ -31,20 +31,20 @@ macro_rules! status {
 #[command(name = "parakeet-transcribe")]
 #[command(about = "Transcribe audio using Parakeet TDT")]
 struct Args {
-    /// Path to audio file
-    audio_file: String,
+    /// Path to audio file (omit to configure default settings)
+    audio_file: Option<String>,
 
     /// Model name (v2 or v3)
-    #[arg(long, default_value = "nemo-parakeet-tdt-0.6b-v2")]
-    model: String,
+    #[arg(long)]
+    model: Option<String>,
 
     /// Chunk duration in seconds for long files
-    #[arg(long, default_value = "120.0")]
-    chunk_duration: f32,
+    #[arg(long)]
+    chunk_duration: Option<f32>,
 
     /// Model quantization (int8 or none)
-    #[arg(long, default_value = "int8")]
-    quantization: String,
+    #[arg(long)]
+    quantization: Option<String>,
 
     /// Output JSON lines instead of plain text
     #[arg(long)]
@@ -65,6 +65,226 @@ struct Args {
     /// File to create when transcription is complete
     #[arg(long)]
     completion_marker: Option<String>,
+}
+
+// ------------------------------------------------------------
+// Saved defaults
+// ------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct SavedConfig {
+    #[serde(default = "default_model")]
+    model: String,
+    #[serde(default = "default_chunk_duration")]
+    chunk_duration: f32,
+    #[serde(default = "default_quantization")]
+    quantization: String,
+    #[serde(default)]
+    timestamps: bool,
+    #[serde(default)]
+    diarize: bool,
+}
+
+fn default_model() -> String {
+    "nemo-parakeet-tdt-0.6b-v2".to_string()
+}
+fn default_chunk_duration() -> f32 {
+    120.0
+}
+fn default_quantization() -> String {
+    "int8".to_string()
+}
+
+impl Default for SavedConfig {
+    fn default() -> Self {
+        Self {
+            model: default_model(),
+            chunk_duration: default_chunk_duration(),
+            quantization: default_quantization(),
+            timestamps: false,
+            diarize: false,
+        }
+    }
+}
+
+fn config_path() -> Result<PathBuf> {
+    let dir = dirs::config_dir()
+        .ok_or_else(|| eyre::eyre!("Could not find config directory"))?
+        .join("parakeet-transcribe");
+    Ok(dir.join("config.json"))
+}
+
+fn load_config() -> SavedConfig {
+    config_path()
+        .ok()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_config(config: &SavedConfig) -> Result<()> {
+    let path = config_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(config)?;
+    fs::write(&path, json)?;
+    Ok(())
+}
+
+/// Resolve effective settings: CLI args override saved config defaults.
+struct ResolvedArgs {
+    audio_file: String,
+    model: String,
+    chunk_duration: f32,
+    quantization: String,
+    json: bool,
+    timestamps: bool,
+    diarize: bool,
+    debug: bool,
+    completion_marker: Option<String>,
+}
+
+impl ResolvedArgs {
+    fn from_args_and_config(args: &Args, config: &SavedConfig) -> Self {
+        Self {
+            audio_file: args.audio_file.clone().unwrap_or_default(),
+            model: args.model.clone().unwrap_or_else(|| config.model.clone()),
+            chunk_duration: args.chunk_duration.unwrap_or(config.chunk_duration),
+            quantization: args
+                .quantization
+                .clone()
+                .unwrap_or_else(|| config.quantization.clone()),
+            json: args.json,
+            timestamps: args.timestamps || config.timestamps,
+            diarize: args.diarize || config.diarize,
+            debug: args.debug,
+            completion_marker: args.completion_marker.clone(),
+        }
+    }
+}
+
+fn prompt_line(prompt: &str) -> String {
+    eprint!("{}", prompt);
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut line);
+    line.trim().to_string()
+}
+
+fn run_settings_wizard() -> Result<()> {
+    let current = load_config();
+
+    eprintln!("=== Parakeet Transcribe - Default Settings ===");
+    eprintln!();
+
+    // Model
+    eprintln!("Model options:");
+    eprintln!("  [1] nemo-parakeet-tdt-0.6b-v2");
+    eprintln!("  [2] nemo-parakeet-tdt-0.6b-v3");
+    let current_model_num = if current.model == "nemo-parakeet-tdt-0.6b-v3" {
+        "2"
+    } else {
+        "1"
+    };
+    let model_choice = prompt_line(&format!("Choose model [{}]: ", current_model_num));
+    let model = match model_choice.as_str() {
+        "1" => "nemo-parakeet-tdt-0.6b-v2".to_string(),
+        "2" => "nemo-parakeet-tdt-0.6b-v3".to_string(),
+        "" => current.model.clone(),
+        _ => {
+            eprintln!("Invalid choice, keeping current: {}", current.model);
+            current.model.clone()
+        }
+    };
+
+    // Quantization
+    eprintln!();
+    eprintln!("Quantization options:");
+    eprintln!("  [1] int8 (smaller, faster)");
+    eprintln!("  [2] none (full precision)");
+    let current_quant_num = if current.quantization == "none" {
+        "2"
+    } else {
+        "1"
+    };
+    let quant_choice = prompt_line(&format!("Choose quantization [{}]: ", current_quant_num));
+    let quantization = match quant_choice.as_str() {
+        "1" => "int8".to_string(),
+        "2" => "none".to_string(),
+        "" => current.quantization.clone(),
+        _ => {
+            eprintln!(
+                "Invalid choice, keeping current: {}",
+                current.quantization
+            );
+            current.quantization.clone()
+        }
+    };
+
+    // Output mode
+    eprintln!();
+    eprintln!("Default output mode:");
+    eprintln!("  [1] Plain text");
+    eprintln!("  [2] With timestamps");
+    eprintln!("  [3] With speakers (diarization)");
+    eprintln!("  [4] With speakers + timestamps");
+    let current_mode = match (current.diarize, current.timestamps) {
+        (false, false) => "1",
+        (false, true) => "2",
+        (true, false) => "3",
+        (true, true) => "4",
+    };
+    let mode_choice = prompt_line(&format!("Choose output mode [{}]: ", current_mode));
+    let (diarize, timestamps) = match mode_choice.as_str() {
+        "1" => (false, false),
+        "2" => (false, true),
+        "3" => (true, false),
+        "4" => (true, true),
+        "" => (current.diarize, current.timestamps),
+        _ => {
+            eprintln!("Invalid choice, keeping current mode.");
+            (current.diarize, current.timestamps)
+        }
+    };
+
+    // Chunk duration
+    eprintln!();
+    let chunk_input = prompt_line(&format!(
+        "Chunk duration in seconds for long files [{}]: ",
+        current.chunk_duration
+    ));
+    let chunk_duration = if chunk_input.is_empty() {
+        current.chunk_duration
+    } else {
+        chunk_input
+            .parse::<f32>()
+            .unwrap_or_else(|_| {
+                eprintln!(
+                    "Invalid number, keeping current: {}",
+                    current.chunk_duration
+                );
+                current.chunk_duration
+            })
+    };
+
+    let config = SavedConfig {
+        model,
+        chunk_duration,
+        quantization,
+        timestamps,
+        diarize,
+    };
+
+    save_config(&config)?;
+
+    eprintln!();
+    eprintln!("Settings saved! These will be used as defaults for future transcriptions.");
+    eprintln!("You can override any setting with command-line flags (e.g. --timestamps).");
+    let path = config_path()?;
+    eprintln!("Config file: {}", path.display());
+
+    Ok(())
 }
 
 #[derive(Serialize, Debug)]
@@ -611,7 +831,7 @@ fn group_by_speaker(segments: &[Segment], speakers: &[Option<usize>]) -> Vec<Spe
 // Main logic
 // ------------------------------------------------------------
 
-fn run(args: &Args) -> Result<()> {
+fn run(args: &ResolvedArgs) -> Result<()> {
     let start_time = Instant::now();
 
     let audio_path = Path::new(&args.audio_file);
@@ -884,10 +1104,22 @@ fn wait_for_keypress() {
 
 fn main() {
     let args = Args::parse();
-    let marker_path = args.completion_marker.clone();
-    let is_json = args.json;
 
-    let result = run(&args);
+    // No audio file → enter settings wizard
+    if args.audio_file.is_none() {
+        if let Err(e) = run_settings_wizard() {
+            eprintln!("ERROR: {:#}", e);
+        }
+        wait_for_keypress();
+        return;
+    }
+
+    let config = load_config();
+    let resolved = ResolvedArgs::from_args_and_config(&args, &config);
+    let marker_path = resolved.completion_marker.clone();
+    let is_json = resolved.json;
+
+    let result = run(&resolved);
 
     // Always write completion marker if specified (even on error)
     if let Some(ref path) = marker_path {
