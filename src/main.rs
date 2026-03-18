@@ -180,8 +180,8 @@ fn run_settings_wizard() -> Result<()> {
 
     // Model
     eprintln!("Model options:");
-    eprintln!("  [1] nemo-parakeet-tdt-0.6b-v2");
-    eprintln!("  [2] nemo-parakeet-tdt-0.6b-v3");
+    eprintln!("  [1] nemo-parakeet-tdt-0.6b-v2 (English only)");
+    eprintln!("  [2] nemo-parakeet-tdt-0.6b-v3 (less accurate for English, supports 10 European languages)");
     let current_model_num = if current.model == "nemo-parakeet-tdt-0.6b-v3" {
         "2"
     } else {
@@ -202,7 +202,7 @@ fn run_settings_wizard() -> Result<()> {
     eprintln!();
     eprintln!("Quantization options:");
     eprintln!("  [1] int8 (smaller, faster)");
-    eprintln!("  [2] none (full precision)");
+    eprintln!("  [2] none (more accurate, much slower)");
     let current_quant_num = if current.quantization == "none" {
         "2"
     } else {
