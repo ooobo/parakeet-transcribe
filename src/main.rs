@@ -83,6 +83,8 @@ struct SavedConfig {
     timestamps: bool,
     #[serde(default)]
     diarize: bool,
+    #[serde(default)]
+    debug: bool,
 }
 
 fn default_model() -> String {
@@ -103,6 +105,7 @@ impl Default for SavedConfig {
             quantization: default_quantization(),
             timestamps: false,
             diarize: false,
+            debug: false,
         }
     }
 }
@@ -158,7 +161,7 @@ impl ResolvedArgs {
             json: args.json,
             timestamps: args.timestamps || config.timestamps,
             diarize: args.diarize || config.diarize,
-            debug: args.debug,
+            debug: args.debug || config.debug,
             completion_marker: args.completion_marker.clone(),
         }
     }
@@ -268,12 +271,30 @@ fn run_settings_wizard() -> Result<()> {
             })
     };
 
+    // Debug mode
+    eprintln!();
+    eprintln!("Enable debug mode?");
+    eprintln!("  [1] No");
+    eprintln!("  [2] Yes (show verbose status messages)");
+    let current_debug_num = if current.debug { "2" } else { "1" };
+    let debug_choice = prompt_line(&format!("Choose [{}]: ", current_debug_num));
+    let debug = match debug_choice.as_str() {
+        "1" => false,
+        "2" => true,
+        "" => current.debug,
+        _ => {
+            eprintln!("Invalid choice, keeping current.");
+            current.debug
+        }
+    };
+
     let config = SavedConfig {
         model,
         chunk_duration,
         quantization,
         timestamps,
         diarize,
+        debug,
     };
 
     save_config(&config)?;
@@ -856,6 +877,11 @@ fn run(args: &ResolvedArgs) -> Result<()> {
 
     let debug = args.debug;
 
+    let filename = Path::new(&args.audio_file)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| args.audio_file.clone());
+
     status!(
         debug,
         "Using model: {} with quantization: {}",
@@ -873,6 +899,8 @@ fn run(args: &ResolvedArgs) -> Result<()> {
         duration,
         audio_samples.len()
     );
+
+    eprintln!("Transcribing {} of {:.0}s...", filename, duration);
 
     let is_json = args.json;
     let use_timestamps = args.timestamps;
@@ -1032,7 +1060,10 @@ fn run(args: &ResolvedArgs) -> Result<()> {
                     eprintln!("Warning: could not access clipboard: {}", e);
                 }
             }
-            status!(debug, "Transcript copied to clipboard.");
+            eprintln!(
+                "Transcribed in {:.2}s, transcript copied to clipboard",
+                start_time.elapsed().as_secs_f32()
+            );
         } else if args.json {
             for segment in &segments {
                 println!("{}", serde_json::to_string(segment)?);
@@ -1085,14 +1116,11 @@ fn run(args: &ResolvedArgs) -> Result<()> {
             }
         }
 
-        status!(debug, "Transcript copied to clipboard.");
+        eprintln!(
+            "Transcribed in {:.2}s, transcript copied to clipboard",
+            start_time.elapsed().as_secs_f32()
+        );
     }
-
-    status!(
-        debug,
-        "\nDone in {:.2}s",
-        start_time.elapsed().as_secs_f32()
-    );
 
     Ok(())
 }
