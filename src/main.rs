@@ -4,9 +4,9 @@ use hf_hub::api::sync::Api;
 use parakeet_rs::sortformer::{DiarizationConfig, Sortformer, SpeakerSegment};
 use parakeet_rs::{ExecutionConfig, ParakeetTDT, TimestampMode, Transcriber};
 use rubato::{FftFixedIn, Resampler};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::{Cursor, Read, Write};
+use std::io::{BufRead, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use symphonia::core::audio::SampleBuffer;
@@ -31,20 +31,20 @@ macro_rules! status {
 #[command(name = "parakeet-transcribe")]
 #[command(about = "Transcribe audio using Parakeet TDT")]
 struct Args {
-    /// Path to audio file
-    audio_file: String,
+    /// Path to audio file (omit to configure default settings)
+    audio_file: Option<String>,
 
     /// Model name (v2 or v3)
-    #[arg(long, default_value = "nemo-parakeet-tdt-0.6b-v2")]
-    model: String,
+    #[arg(long)]
+    model: Option<String>,
 
     /// Chunk duration in seconds for long files
-    #[arg(long, default_value = "120.0")]
-    chunk_duration: f32,
+    #[arg(long)]
+    chunk_duration: Option<f32>,
 
     /// Model quantization (int8 or none)
-    #[arg(long, default_value = "int8")]
-    quantization: String,
+    #[arg(long)]
+    quantization: Option<String>,
 
     /// Output JSON lines instead of plain text
     #[arg(long)]
@@ -65,6 +65,254 @@ struct Args {
     /// File to create when transcription is complete
     #[arg(long)]
     completion_marker: Option<String>,
+}
+
+// ------------------------------------------------------------
+// Saved defaults
+// ------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct SavedConfig {
+    #[serde(default = "default_model")]
+    model: String,
+    #[serde(default = "default_chunk_duration")]
+    chunk_duration: f32,
+    #[serde(default = "default_quantization")]
+    quantization: String,
+    #[serde(default)]
+    timestamps: bool,
+    #[serde(default)]
+    diarize: bool,
+    #[serde(default)]
+    debug: bool,
+}
+
+fn default_model() -> String {
+    "nemo-parakeet-tdt-0.6b-v2".to_string()
+}
+fn default_chunk_duration() -> f32 {
+    120.0
+}
+fn default_quantization() -> String {
+    "int8".to_string()
+}
+
+impl Default for SavedConfig {
+    fn default() -> Self {
+        Self {
+            model: default_model(),
+            chunk_duration: default_chunk_duration(),
+            quantization: default_quantization(),
+            timestamps: false,
+            diarize: false,
+            debug: false,
+        }
+    }
+}
+
+fn config_path() -> Result<PathBuf> {
+    let dir = dirs::config_dir()
+        .ok_or_else(|| eyre::eyre!("Could not find config directory"))?
+        .join("parakeet-transcribe");
+    Ok(dir.join("config.json"))
+}
+
+fn load_config() -> SavedConfig {
+    config_path()
+        .ok()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_config(config: &SavedConfig) -> Result<()> {
+    let path = config_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(config)?;
+    fs::write(&path, json)?;
+    Ok(())
+}
+
+/// Resolve effective settings: CLI args override saved config defaults.
+struct ResolvedArgs {
+    audio_file: String,
+    model: String,
+    chunk_duration: f32,
+    quantization: String,
+    json: bool,
+    timestamps: bool,
+    diarize: bool,
+    debug: bool,
+    completion_marker: Option<String>,
+}
+
+impl ResolvedArgs {
+    fn from_args_and_config(args: &Args, config: &SavedConfig) -> Self {
+        Self {
+            audio_file: args.audio_file.clone().unwrap_or_default(),
+            model: args.model.clone().unwrap_or_else(|| config.model.clone()),
+            chunk_duration: args.chunk_duration.unwrap_or(config.chunk_duration),
+            quantization: args
+                .quantization
+                .clone()
+                .unwrap_or_else(|| config.quantization.clone()),
+            json: args.json,
+            timestamps: args.timestamps || config.timestamps,
+            diarize: args.diarize || config.diarize,
+            debug: args.debug || config.debug,
+            completion_marker: args.completion_marker.clone(),
+        }
+    }
+}
+
+fn prompt_line(prompt: &str) -> String {
+    eprint!("{}", prompt);
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut line);
+    line.trim().to_string()
+}
+
+fn run_settings_wizard() -> Result<()> {
+    let current = load_config();
+
+    eprintln!("=== Parakeet Transcribe - Default Settings ===");
+    eprintln!();
+
+    // Model
+    eprintln!("Model options:");
+    eprintln!("  [1] nemo-parakeet-tdt-0.6b-v2 (English only)");
+    eprintln!("  [2] nemo-parakeet-tdt-0.6b-v3 (less accurate for English, supports 10 European languages)");
+    let current_model_num = if current.model == "nemo-parakeet-tdt-0.6b-v3" {
+        "2"
+    } else {
+        "1"
+    };
+    let model_choice = prompt_line(&format!(
+        "Type number to select option (default: {}) >> ",
+        current_model_num
+    ));
+    let model = match model_choice.as_str() {
+        "1" => "nemo-parakeet-tdt-0.6b-v2".to_string(),
+        "2" => "nemo-parakeet-tdt-0.6b-v3".to_string(),
+        "" => current.model.clone(),
+        _ => {
+            eprintln!("Invalid choice, keeping current: {}", current.model);
+            current.model.clone()
+        }
+    };
+
+    // Quantization
+    eprintln!();
+    eprintln!("Quantization options:");
+    eprintln!("  [1] int8 (smaller, faster)");
+    eprintln!("  [2] none (more accurate, much slower)");
+    let current_quant_num = if current.quantization == "none" {
+        "2"
+    } else {
+        "1"
+    };
+    let quant_choice = prompt_line(&format!(
+        "Type number to select option (default: {}) >> ",
+        current_quant_num
+    ));
+    let quantization = match quant_choice.as_str() {
+        "1" => "int8".to_string(),
+        "2" => "none".to_string(),
+        "" => current.quantization.clone(),
+        _ => {
+            eprintln!("Invalid choice, keeping current: {}", current.quantization);
+            current.quantization.clone()
+        }
+    };
+
+    // Output mode
+    eprintln!();
+    eprintln!("Default output mode:");
+    eprintln!("  [1] Plain text");
+    eprintln!("  [2] With timestamps");
+    eprintln!("  [3] With speakers (diarization)");
+    eprintln!("  [4] With speakers + timestamps");
+    let current_mode = match (current.diarize, current.timestamps) {
+        (false, false) => "1",
+        (false, true) => "2",
+        (true, false) => "3",
+        (true, true) => "4",
+    };
+    let mode_choice = prompt_line(&format!(
+        "Type number to select option (default: {}) >> ",
+        current_mode
+    ));
+    let (diarize, timestamps) = match mode_choice.as_str() {
+        "1" => (false, false),
+        "2" => (false, true),
+        "3" => (true, false),
+        "4" => (true, true),
+        "" => (current.diarize, current.timestamps),
+        _ => {
+            eprintln!("Invalid choice, keeping current mode.");
+            (current.diarize, current.timestamps)
+        }
+    };
+
+    // Chunk duration
+    eprintln!();
+    let chunk_input = prompt_line(&format!(
+        "Chunk duration in seconds for long files (default: {}) >> ",
+        current.chunk_duration
+    ));
+    let chunk_duration = if chunk_input.is_empty() {
+        current.chunk_duration
+    } else {
+        chunk_input.parse::<f32>().unwrap_or_else(|_| {
+            eprintln!(
+                "Invalid number, keeping current: {}",
+                current.chunk_duration
+            );
+            current.chunk_duration
+        })
+    };
+
+    // Debug mode
+    eprintln!();
+    eprintln!("Enable debug mode?");
+    eprintln!("  [1] No");
+    eprintln!("  [2] Yes (show verbose status messages)");
+    let current_debug_num = if current.debug { "2" } else { "1" };
+    let debug_choice = prompt_line(&format!(
+        "Type number to select option (default: {}) >> ",
+        current_debug_num
+    ));
+    let debug = match debug_choice.as_str() {
+        "1" => false,
+        "2" => true,
+        "" => current.debug,
+        _ => {
+            eprintln!("Invalid choice, keeping current.");
+            current.debug
+        }
+    };
+
+    let config = SavedConfig {
+        model,
+        chunk_duration,
+        quantization,
+        timestamps,
+        diarize,
+        debug,
+    };
+
+    save_config(&config)?;
+
+    eprintln!();
+    eprintln!("Settings saved! These will be used as defaults for future transcriptions.");
+    eprintln!("You can override any setting with command-line flags (e.g. --timestamps).");
+    let path = config_path()?;
+    eprintln!("Config file: {}", path.display());
+
+    Ok(())
 }
 
 #[derive(Serialize, Debug)]
@@ -325,19 +573,10 @@ fn load_audio_from_stream(
 }
 
 fn resample_audio(samples: &[f32], source_rate: u32, target_rate: u32) -> Result<Vec<f32>> {
-    if source_rate == target_rate {
-        return Ok(samples.to_vec());
-    }
-
     let chunk_size = 4096;
-    let mut resampler = FftFixedIn::<f32>::new(
-        source_rate as usize,
-        target_rate as usize,
-        chunk_size,
-        2,
-        1,
-    )
-    .wrap_err("Failed to create resampler")?;
+    let mut resampler =
+        FftFixedIn::<f32>::new(source_rate as usize, target_rate as usize, chunk_size, 2, 1)
+            .wrap_err("Failed to create resampler")?;
 
     let mut output = Vec::new();
     let mut pos = 0;
@@ -549,19 +788,62 @@ fn transcribe_with_chunking(
 }
 
 // ------------------------------------------------------------
+// Output helpers
+// ------------------------------------------------------------
+
+fn format_timestamp(seconds: f32) -> String {
+    let m = (seconds / 60.0) as u32;
+    let s = (seconds % 60.0) as u32;
+    format!("[{:02}:{:02}]", m, s)
+}
+
+fn copy_to_clipboard(text: &str) {
+    match arboard::Clipboard::new() {
+        Ok(mut clipboard) => {
+            if let Err(e) = clipboard.set_text(text) {
+                eprintln!("Warning: could not copy to clipboard: {}", e);
+            }
+        }
+        Err(e) => {
+            eprintln!("Warning: could not access clipboard: {}", e);
+        }
+    }
+}
+
+/// Build a transcript string from segments.
+fn build_transcript(segments: &[Segment], timestamps: bool) -> String {
+    if timestamps {
+        segments
+            .iter()
+            .map(|s| format!("{} {}", format_timestamp(s.start), s.text))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        segments
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+// ------------------------------------------------------------
 // Diarization helpers
 // ------------------------------------------------------------
 
 /// For each transcript segment, find the speaker with the most overlap.
-fn assign_speakers(segments: &[Segment], speaker_segments: &[SpeakerSegment]) -> Vec<Option<usize>> {
+fn assign_speakers(
+    segments: &[Segment],
+    speaker_segments: &[SpeakerSegment],
+) -> Vec<Option<usize>> {
     segments
         .iter()
         .map(|seg| {
             speaker_segments
                 .iter()
                 .filter_map(|s| {
-                    let s_start = s.start as f32 / 16_000.0;
-                    let s_end = s.end as f32 / 16_000.0;
+                    let s_start = s.start as f32 / SAMPLE_RATE as f32;
+                    let s_end = s.end as f32 / SAMPLE_RATE as f32;
                     let overlap_start = seg.start.max(s_start);
                     let overlap_end = seg.end.min(s_end);
                     let overlap = (overlap_end - overlap_start).max(0.0);
@@ -611,7 +893,7 @@ fn group_by_speaker(segments: &[Segment], speakers: &[Option<usize>]) -> Vec<Spe
 // Main logic
 // ------------------------------------------------------------
 
-fn run(args: &Args) -> Result<()> {
+fn run(args: &ResolvedArgs) -> Result<()> {
     let start_time = Instant::now();
 
     let audio_path = Path::new(&args.audio_file);
@@ -620,9 +902,7 @@ fn run(args: &Args) -> Result<()> {
     }
 
     if args.diarize && args.json {
-        return Err(eyre::eyre!(
-            "--diarize is not supported with --json yet"
-        ));
+        return Err(eyre::eyre!("--diarize is not supported with --json yet"));
     }
 
     // Validate quantization
@@ -636,10 +916,16 @@ fn run(args: &Args) -> Result<()> {
 
     let debug = args.debug;
 
+    let filename = audio_path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| args.audio_file.clone());
+
     status!(
         debug,
         "Using model: {} with quantization: {}",
-        args.model, quantization
+        args.model,
+        quantization
     );
     let model_dir = ensure_model_files(&args.model, &quantization, debug)
         .wrap_err("Failed to download model files")?;
@@ -653,6 +939,10 @@ fn run(args: &Args) -> Result<()> {
         duration,
         audio_samples.len()
     );
+
+    eprintln!("Transcribing {} of {:.0}s...", filename, duration);
+
+    let separator = "=============================================";
 
     let is_json = args.json;
     let use_timestamps = args.timestamps;
@@ -668,63 +958,58 @@ fn run(args: &Args) -> Result<()> {
         let audio_for_diarize = audio_samples.clone();
         let half_threads = (total_threads / 2).max(1);
 
-        status!(debug, "Running diarization and transcription in parallel...");
+        status!(
+            debug,
+            "Running diarization and transcription in parallel..."
+        );
 
-        let result: Result<(Vec<SpeakerSegment>, Vec<Segment>)> =
-            std::thread::scope(|s| {
-                let diarize_handle = s.spawn(|| -> Result<Vec<SpeakerSegment>> {
-                    status!(debug, "Loading sortformer model...");
-                    let sortformer_path = ensure_sortformer_model(debug)
-                        .wrap_err("Failed to download sortformer model")?;
+        let result: Result<(Vec<SpeakerSegment>, Vec<Segment>)> = std::thread::scope(|s| {
+            let diarize_handle = s.spawn(|| -> Result<Vec<SpeakerSegment>> {
+                status!(debug, "Loading sortformer model...");
+                let sortformer_path = ensure_sortformer_model(debug)
+                    .wrap_err("Failed to download sortformer model")?;
 
-                    let exec_config = ExecutionConfig::new()
-                        .with_intra_threads(half_threads);
-                    let mut sortformer = Sortformer::with_config(
-                        sortformer_path.to_str().unwrap(),
-                        Some(exec_config),
-                        DiarizationConfig::callhome(),
-                    )
-                    .wrap_err("Failed to load sortformer model")?;
+                let exec_config = ExecutionConfig::new().with_intra_threads(half_threads);
+                let mut sortformer = Sortformer::with_config(
+                    sortformer_path.to_str().unwrap(),
+                    Some(exec_config),
+                    DiarizationConfig::callhome(),
+                )
+                .wrap_err("Failed to load sortformer model")?;
 
-                    // Use smaller chunks for faster inference — halves the input
-                    // size per ONNX call (attention is quadratic in chunk size)
-                    sortformer.chunk_len = 62;
-                    sortformer.fifo_len = 62;
-                    sortformer.spkcache_len = 94;
+                // Use smaller chunks for faster inference — halves the input
+                // size per ONNX call (attention is quadratic in chunk size)
+                sortformer.chunk_len = 62;
+                sortformer.fifo_len = 62;
+                sortformer.spkcache_len = 94;
 
-                    status!(debug, "Running speaker diarization...");
-                    let segs = sortformer
-                        .diarize(audio_for_diarize, SAMPLE_RATE, 1)
-                        .wrap_err("Diarization failed")?;
-                    status!(debug, "Found {} speaker segments", segs.len());
-                    Ok(segs)
-                });
-
-                let transcribe_handle = s.spawn(|| -> Result<Vec<Segment>> {
-                    status!(debug, "Loading model...");
-                    let exec_config = ExecutionConfig::new()
-                        .with_intra_threads(half_threads);
-                    let mut parakeet = ParakeetTDT::from_pretrained(&model_dir, Some(exec_config))
-                        .wrap_err("Failed to load Parakeet TDT model")?;
-
-                    status!(debug, "Transcribing...");
-                    transcribe_with_chunking(
-                        &mut parakeet,
-                        audio_samples,
-                        chunk_duration,
-                        None,
-                    )
-                });
-
-                let speaker_segs = diarize_handle
-                    .join()
-                    .map_err(|_| eyre::eyre!("Diarization thread panicked"))??;
-                let transcript_segs = transcribe_handle
-                    .join()
-                    .map_err(|_| eyre::eyre!("Transcription thread panicked"))??;
-
-                Ok((speaker_segs, transcript_segs))
+                status!(debug, "Running speaker diarization...");
+                let segs = sortformer
+                    .diarize(audio_for_diarize, SAMPLE_RATE, 1)
+                    .wrap_err("Diarization failed")?;
+                status!(debug, "Found {} speaker segments", segs.len());
+                Ok(segs)
             });
+
+            let transcribe_handle = s.spawn(|| -> Result<Vec<Segment>> {
+                status!(debug, "Loading model...");
+                let exec_config = ExecutionConfig::new().with_intra_threads(half_threads);
+                let mut parakeet = ParakeetTDT::from_pretrained(&model_dir, Some(exec_config))
+                    .wrap_err("Failed to load Parakeet TDT model")?;
+
+                status!(debug, "Transcribing...");
+                transcribe_with_chunking(&mut parakeet, audio_samples, chunk_duration, None)
+            });
+
+            let speaker_segs = diarize_handle
+                .join()
+                .map_err(|_| eyre::eyre!("Diarization thread panicked"))??;
+            let transcript_segs = transcribe_handle
+                .join()
+                .map_err(|_| eyre::eyre!("Transcription thread panicked"))??;
+
+            Ok((speaker_segs, transcript_segs))
+        });
 
         let (speaker_segs, transcript_segs) = result?;
         (Some(speaker_segs), transcript_segs)
@@ -736,6 +1021,12 @@ fn run(args: &Args) -> Result<()> {
 
         status!(debug, "Transcribing...");
 
+        let will_chunk = duration > chunk_duration;
+        if !is_json && will_chunk {
+            eprintln!();
+            eprintln!("{}", separator);
+            eprintln!();
+        }
         let mut stream_cb = |segments: &[Segment]| {
             for seg in segments {
                 if is_json {
@@ -743,9 +1034,7 @@ fn run(args: &Args) -> Result<()> {
                         println!("{}", json);
                     }
                 } else if use_timestamps {
-                    let minutes = (seg.start / 60.0) as u32;
-                    let seconds = (seg.start % 60.0) as u32;
-                    println!("[{:02}:{:02}] {}", minutes, seconds, seg.text);
+                    println!("{} {}", format_timestamp(seg.start), seg.text);
                 } else {
                     println!("{}", seg.text);
                 }
@@ -760,134 +1049,101 @@ fn run(args: &Args) -> Result<()> {
             Some(&mut stream_cb),
         )?;
 
+        if !is_json && will_chunk {
+            eprintln!();
+            eprintln!("{}", separator);
+        }
+
         (None, segs)
     };
 
-    // For short files the callback isn't invoked, so finalize and output here
+    // For short files the streaming callback isn't invoked, so finalize and output here
     let was_chunked = duration > args.chunk_duration;
+    if !was_chunked {
+        finalize_segments(&mut segments);
+    }
 
-    if !was_chunked || args.diarize {
-        if !was_chunked {
-            finalize_segments(&mut segments);
-        }
+    if args.diarize {
+        let speaker_segs = speaker_segments.as_ref().unwrap();
+        let speakers = assign_speakers(&segments, speaker_segs);
+        let turns = group_by_speaker(&segments, &speakers);
 
-        if args.diarize {
-            // Match speakers and group into turns
-            let speaker_segs = speaker_segments.as_ref().unwrap();
-            let speakers = assign_speakers(&segments, speaker_segs);
-            let turns = group_by_speaker(&segments, &speakers);
-
-            for turn in &turns {
+        let lines: Vec<String> = turns
+            .iter()
+            .map(|t| {
                 if use_timestamps {
-                    let minutes = (turn.start / 60.0) as u32;
-                    let seconds = (turn.start % 60.0) as u32;
-                    println!("[{}:{:02}] - {}", minutes, seconds, turn.text);
+                    format!("{} - {}", format_timestamp(t.start), t.text)
                 } else {
-                    println!("- {}", turn.text);
+                    format!("- {}", t.text)
                 }
-            }
+            })
+            .collect();
 
-            // Clipboard
-            let transcript = turns
-                .iter()
-                .map(|t| {
-                    if use_timestamps {
-                        let minutes = (t.start / 60.0) as u32;
-                        let seconds = (t.start % 60.0) as u32;
-                        format!("[{}:{:02}] - {}", minutes, seconds, t.text)
-                    } else {
-                        format!("- {}", t.text)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+        eprintln!();
+        eprintln!("{}", separator);
+        eprintln!();
+        for line in &lines {
+            println!("{}", line);
+        }
+        eprintln!();
+        eprintln!("{}", separator);
 
-            match arboard::Clipboard::new() {
-                Ok(mut clipboard) => {
-                    if let Err(e) = clipboard.set_text(&transcript) {
-                        eprintln!("Warning: could not copy to clipboard: {}", e);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Warning: could not access clipboard: {}", e);
-                }
-            }
-            status!(debug, "Transcript copied to clipboard.");
-        } else if args.json {
+        copy_to_clipboard(&lines.join("\n"));
+        eprint!(
+            "\nTranscribed in {:.2}s, transcript copied to clipboard.",
+            start_time.elapsed().as_secs_f32()
+        );
+    } else if args.json {
+        if !was_chunked {
             for segment in &segments {
                 println!("{}", serde_json::to_string(segment)?);
             }
             std::io::stdout().flush()?;
-        } else if args.timestamps {
-            for seg in &segments {
-                let minutes = (seg.start / 60.0) as u32;
-                let seconds = (seg.start % 60.0) as u32;
-                println!("[{:02}:{:02}] {}", minutes, seconds, seg.text);
-            }
-        } else {
-            let transcript = segments
-                .iter()
-                .map(|s| s.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
+        }
+    } else {
+        let transcript = build_transcript(&segments, use_timestamps);
+        if !was_chunked {
+            eprintln!();
+            eprintln!("{}", separator);
+            eprintln!();
             println!("{}", transcript);
+            eprintln!();
+            eprintln!("{}", separator);
         }
+        copy_to_clipboard(&transcript);
+        eprint!(
+            "\nTranscribed in {:.2}s, transcript copied to clipboard.",
+            start_time.elapsed().as_secs_f32()
+        );
     }
-
-    if !args.json && !args.diarize {
-        // Build full transcript for clipboard
-        let transcript = if args.timestamps {
-            segments
-                .iter()
-                .map(|s| {
-                    let minutes = (s.start / 60.0) as u32;
-                    let seconds = (s.start % 60.0) as u32;
-                    format!("[{:02}:{:02}] {}", minutes, seconds, s.text)
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            segments
-                .iter()
-                .map(|s| s.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
-
-        match arboard::Clipboard::new() {
-            Ok(mut clipboard) => {
-                if let Err(e) = clipboard.set_text(&transcript) {
-                    eprintln!("Warning: could not copy to clipboard: {}", e);
-                }
-            }
-            Err(e) => {
-                eprintln!("Warning: could not access clipboard: {}", e);
-            }
-        }
-
-        status!(debug, "Transcript copied to clipboard.");
-    }
-
-    status!(
-        debug,
-        "\nDone in {:.2}s",
-        start_time.elapsed().as_secs_f32()
-    );
 
     Ok(())
 }
 
 fn wait_for_keypress() {
-    eprintln!("\nPress any key to close...");
+    eprint!(" Press any key to close...");
+    let _ = std::io::stderr().flush();
     let _ = std::io::stdin().read(&mut [0u8]);
 }
 
 fn main() {
     let args = Args::parse();
-    let marker_path = args.completion_marker.clone();
-    let is_json = args.json;
 
-    let result = run(&args);
+    // No audio file → enter settings wizard
+    if args.audio_file.is_none() {
+        if let Err(e) = run_settings_wizard() {
+            eprintln!("ERROR: {:#}", e);
+        }
+        wait_for_keypress();
+        return;
+    }
+
+    let config = load_config();
+    let resolved = ResolvedArgs::from_args_and_config(&args, &config);
+    let marker_path = resolved.completion_marker.clone();
+    let is_json = resolved.json;
+
+    let result = run(&resolved);
 
     // Always write completion marker if specified (even on error)
     if let Some(ref path) = marker_path {
@@ -920,7 +1176,10 @@ mod tests {
 
     #[test]
     fn test_clean_digit_separator() {
-        assert_eq!(clean_segment_text("$30 ,000 difference"), "$30,000 difference");
+        assert_eq!(
+            clean_segment_text("$30 ,000 difference"),
+            "$30,000 difference"
+        );
         assert_eq!(clean_segment_text("$1 ,000 ,000"), "$1,000,000");
     }
 
@@ -937,9 +1196,21 @@ mod tests {
     #[test]
     fn test_merge_orphaned_punctuation() {
         let mut segments = vec![
-            Segment { text: "Washington, D.C".to_string(), start: 0.0, end: 1.0 },
-            Segment { text: ".".to_string(), start: 1.0, end: 1.1 },
-            Segment { text: "Next sentence.".to_string(), start: 1.1, end: 2.0 },
+            Segment {
+                text: "Washington, D.C".to_string(),
+                start: 0.0,
+                end: 1.0,
+            },
+            Segment {
+                text: ".".to_string(),
+                start: 1.0,
+                end: 1.1,
+            },
+            Segment {
+                text: "Next sentence.".to_string(),
+                start: 1.1,
+                end: 2.0,
+            },
         ];
         merge_orphaned_punctuation(&mut segments);
         assert_eq!(segments.len(), 2);

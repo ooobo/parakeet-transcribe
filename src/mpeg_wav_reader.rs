@@ -1,6 +1,6 @@
 // Custom reader for MPEG-in-WAV files (BWF files with MPEG audio)
-use std::io::{Read, Seek, SeekFrom};
 use eyre::Result;
+use std::io::{Read, Seek, SeekFrom};
 
 #[derive(Debug)]
 struct RiffChunk {
