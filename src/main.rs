@@ -1024,6 +1024,7 @@ fn run(args: &ResolvedArgs) -> Result<()> {
         if !is_json {
             eprintln!();
             eprintln!("{}", separator);
+            eprintln!();
         }
         let mut stream_cb = |segments: &[Segment]| {
             for seg in segments {
@@ -1048,6 +1049,7 @@ fn run(args: &ResolvedArgs) -> Result<()> {
         )?;
 
         if !is_json {
+            eprintln!();
             eprintln!("{}", separator);
         }
 
@@ -1078,9 +1080,11 @@ fn run(args: &ResolvedArgs) -> Result<()> {
 
         eprintln!();
         eprintln!("{}", separator);
+        eprintln!();
         for line in &lines {
             println!("{}", line);
         }
+        eprintln!();
         eprintln!("{}", separator);
 
         copy_to_clipboard(&lines.join("\n"));
@@ -1100,7 +1104,9 @@ fn run(args: &ResolvedArgs) -> Result<()> {
         if !was_chunked {
             eprintln!();
             eprintln!("{}", separator);
+            eprintln!();
             println!("{}", transcript);
+            eprintln!();
             eprintln!("{}", separator);
         }
         copy_to_clipboard(&transcript);
