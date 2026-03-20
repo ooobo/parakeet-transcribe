@@ -1021,7 +1021,8 @@ fn run(args: &ResolvedArgs) -> Result<()> {
 
         status!(debug, "Transcribing...");
 
-        if !is_json {
+        let will_chunk = duration > chunk_duration;
+        if !is_json && will_chunk {
             eprintln!();
             eprintln!("{}", separator);
             eprintln!();
@@ -1048,7 +1049,7 @@ fn run(args: &ResolvedArgs) -> Result<()> {
             Some(&mut stream_cb),
         )?;
 
-        if !is_json {
+        if !is_json && will_chunk {
             eprintln!();
             eprintln!("{}", separator);
         }
