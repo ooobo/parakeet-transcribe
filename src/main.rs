@@ -190,7 +190,10 @@ fn run_settings_wizard() -> Result<()> {
     } else {
         "1"
     };
-    let model_choice = prompt_line(&format!("Type number to select option (default: {}) >> ", current_model_num));
+    let model_choice = prompt_line(&format!(
+        "Type number to select option (default: {}) >> ",
+        current_model_num
+    ));
     let model = match model_choice.as_str() {
         "1" => "nemo-parakeet-tdt-0.6b-v2".to_string(),
         "2" => "nemo-parakeet-tdt-0.6b-v3".to_string(),
@@ -211,16 +214,16 @@ fn run_settings_wizard() -> Result<()> {
     } else {
         "1"
     };
-    let quant_choice = prompt_line(&format!("Type number to select option (default: {}) >> ", current_quant_num));
+    let quant_choice = prompt_line(&format!(
+        "Type number to select option (default: {}) >> ",
+        current_quant_num
+    ));
     let quantization = match quant_choice.as_str() {
         "1" => "int8".to_string(),
         "2" => "none".to_string(),
         "" => current.quantization.clone(),
         _ => {
-            eprintln!(
-                "Invalid choice, keeping current: {}",
-                current.quantization
-            );
+            eprintln!("Invalid choice, keeping current: {}", current.quantization);
             current.quantization.clone()
         }
     };
@@ -238,7 +241,10 @@ fn run_settings_wizard() -> Result<()> {
         (true, false) => "3",
         (true, true) => "4",
     };
-    let mode_choice = prompt_line(&format!("Type number to select option (default: {}) >> ", current_mode));
+    let mode_choice = prompt_line(&format!(
+        "Type number to select option (default: {}) >> ",
+        current_mode
+    ));
     let (diarize, timestamps) = match mode_choice.as_str() {
         "1" => (false, false),
         "2" => (false, true),
@@ -260,15 +266,13 @@ fn run_settings_wizard() -> Result<()> {
     let chunk_duration = if chunk_input.is_empty() {
         current.chunk_duration
     } else {
-        chunk_input
-            .parse::<f32>()
-            .unwrap_or_else(|_| {
-                eprintln!(
-                    "Invalid number, keeping current: {}",
-                    current.chunk_duration
-                );
+        chunk_input.parse::<f32>().unwrap_or_else(|_| {
+            eprintln!(
+                "Invalid number, keeping current: {}",
                 current.chunk_duration
-            })
+            );
+            current.chunk_duration
+        })
     };
 
     // Debug mode
@@ -277,7 +281,10 @@ fn run_settings_wizard() -> Result<()> {
     eprintln!("  [1] No");
     eprintln!("  [2] Yes (show verbose status messages)");
     let current_debug_num = if current.debug { "2" } else { "1" };
-    let debug_choice = prompt_line(&format!("Type number to select option (default: {}) >> ", current_debug_num));
+    let debug_choice = prompt_line(&format!(
+        "Type number to select option (default: {}) >> ",
+        current_debug_num
+    ));
     let debug = match debug_choice.as_str() {
         "1" => false,
         "2" => true,
@@ -571,14 +578,9 @@ fn resample_audio(samples: &[f32], source_rate: u32, target_rate: u32) -> Result
     }
 
     let chunk_size = 4096;
-    let mut resampler = FftFixedIn::<f32>::new(
-        source_rate as usize,
-        target_rate as usize,
-        chunk_size,
-        2,
-        1,
-    )
-    .wrap_err("Failed to create resampler")?;
+    let mut resampler =
+        FftFixedIn::<f32>::new(source_rate as usize, target_rate as usize, chunk_size, 2, 1)
+            .wrap_err("Failed to create resampler")?;
 
     let mut output = Vec::new();
     let mut pos = 0;
@@ -834,7 +836,10 @@ fn build_transcript(segments: &[Segment], timestamps: bool) -> String {
 // ------------------------------------------------------------
 
 /// For each transcript segment, find the speaker with the most overlap.
-fn assign_speakers(segments: &[Segment], speaker_segments: &[SpeakerSegment]) -> Vec<Option<usize>> {
+fn assign_speakers(
+    segments: &[Segment],
+    speaker_segments: &[SpeakerSegment],
+) -> Vec<Option<usize>> {
     segments
         .iter()
         .map(|seg| {
@@ -901,9 +906,7 @@ fn run(args: &ResolvedArgs) -> Result<()> {
     }
 
     if args.diarize && args.json {
-        return Err(eyre::eyre!(
-            "--diarize is not supported with --json yet"
-        ));
+        return Err(eyre::eyre!("--diarize is not supported with --json yet"));
     }
 
     // Validate quantization
@@ -925,7 +928,8 @@ fn run(args: &ResolvedArgs) -> Result<()> {
     status!(
         debug,
         "Using model: {} with quantization: {}",
-        args.model, quantization
+        args.model,
+        quantization
     );
     let model_dir = ensure_model_files(&args.model, &quantization, debug)
         .wrap_err("Failed to download model files")?;
@@ -958,63 +962,58 @@ fn run(args: &ResolvedArgs) -> Result<()> {
         let audio_for_diarize = audio_samples.clone();
         let half_threads = (total_threads / 2).max(1);
 
-        status!(debug, "Running diarization and transcription in parallel...");
+        status!(
+            debug,
+            "Running diarization and transcription in parallel..."
+        );
 
-        let result: Result<(Vec<SpeakerSegment>, Vec<Segment>)> =
-            std::thread::scope(|s| {
-                let diarize_handle = s.spawn(|| -> Result<Vec<SpeakerSegment>> {
-                    status!(debug, "Loading sortformer model...");
-                    let sortformer_path = ensure_sortformer_model(debug)
-                        .wrap_err("Failed to download sortformer model")?;
+        let result: Result<(Vec<SpeakerSegment>, Vec<Segment>)> = std::thread::scope(|s| {
+            let diarize_handle = s.spawn(|| -> Result<Vec<SpeakerSegment>> {
+                status!(debug, "Loading sortformer model...");
+                let sortformer_path = ensure_sortformer_model(debug)
+                    .wrap_err("Failed to download sortformer model")?;
 
-                    let exec_config = ExecutionConfig::new()
-                        .with_intra_threads(half_threads);
-                    let mut sortformer = Sortformer::with_config(
-                        sortformer_path.to_str().unwrap(),
-                        Some(exec_config),
-                        DiarizationConfig::callhome(),
-                    )
-                    .wrap_err("Failed to load sortformer model")?;
+                let exec_config = ExecutionConfig::new().with_intra_threads(half_threads);
+                let mut sortformer = Sortformer::with_config(
+                    sortformer_path.to_str().unwrap(),
+                    Some(exec_config),
+                    DiarizationConfig::callhome(),
+                )
+                .wrap_err("Failed to load sortformer model")?;
 
-                    // Use smaller chunks for faster inference — halves the input
-                    // size per ONNX call (attention is quadratic in chunk size)
-                    sortformer.chunk_len = 62;
-                    sortformer.fifo_len = 62;
-                    sortformer.spkcache_len = 94;
+                // Use smaller chunks for faster inference — halves the input
+                // size per ONNX call (attention is quadratic in chunk size)
+                sortformer.chunk_len = 62;
+                sortformer.fifo_len = 62;
+                sortformer.spkcache_len = 94;
 
-                    status!(debug, "Running speaker diarization...");
-                    let segs = sortformer
-                        .diarize(audio_for_diarize, SAMPLE_RATE, 1)
-                        .wrap_err("Diarization failed")?;
-                    status!(debug, "Found {} speaker segments", segs.len());
-                    Ok(segs)
-                });
-
-                let transcribe_handle = s.spawn(|| -> Result<Vec<Segment>> {
-                    status!(debug, "Loading model...");
-                    let exec_config = ExecutionConfig::new()
-                        .with_intra_threads(half_threads);
-                    let mut parakeet = ParakeetTDT::from_pretrained(&model_dir, Some(exec_config))
-                        .wrap_err("Failed to load Parakeet TDT model")?;
-
-                    status!(debug, "Transcribing...");
-                    transcribe_with_chunking(
-                        &mut parakeet,
-                        audio_samples,
-                        chunk_duration,
-                        None,
-                    )
-                });
-
-                let speaker_segs = diarize_handle
-                    .join()
-                    .map_err(|_| eyre::eyre!("Diarization thread panicked"))??;
-                let transcript_segs = transcribe_handle
-                    .join()
-                    .map_err(|_| eyre::eyre!("Transcription thread panicked"))??;
-
-                Ok((speaker_segs, transcript_segs))
+                status!(debug, "Running speaker diarization...");
+                let segs = sortformer
+                    .diarize(audio_for_diarize, SAMPLE_RATE, 1)
+                    .wrap_err("Diarization failed")?;
+                status!(debug, "Found {} speaker segments", segs.len());
+                Ok(segs)
             });
+
+            let transcribe_handle = s.spawn(|| -> Result<Vec<Segment>> {
+                status!(debug, "Loading model...");
+                let exec_config = ExecutionConfig::new().with_intra_threads(half_threads);
+                let mut parakeet = ParakeetTDT::from_pretrained(&model_dir, Some(exec_config))
+                    .wrap_err("Failed to load Parakeet TDT model")?;
+
+                status!(debug, "Transcribing...");
+                transcribe_with_chunking(&mut parakeet, audio_samples, chunk_duration, None)
+            });
+
+            let speaker_segs = diarize_handle
+                .join()
+                .map_err(|_| eyre::eyre!("Diarization thread panicked"))??;
+            let transcript_segs = transcribe_handle
+                .join()
+                .map_err(|_| eyre::eyre!("Transcription thread panicked"))??;
+
+            Ok((speaker_segs, transcript_segs))
+        });
 
         let (speaker_segs, transcript_segs) = result?;
         (Some(speaker_segs), transcript_segs)
@@ -1178,7 +1177,10 @@ mod tests {
 
     #[test]
     fn test_clean_digit_separator() {
-        assert_eq!(clean_segment_text("$30 ,000 difference"), "$30,000 difference");
+        assert_eq!(
+            clean_segment_text("$30 ,000 difference"),
+            "$30,000 difference"
+        );
         assert_eq!(clean_segment_text("$1 ,000 ,000"), "$1,000,000");
     }
 
@@ -1195,9 +1197,21 @@ mod tests {
     #[test]
     fn test_merge_orphaned_punctuation() {
         let mut segments = vec![
-            Segment { text: "Washington, D.C".to_string(), start: 0.0, end: 1.0 },
-            Segment { text: ".".to_string(), start: 1.0, end: 1.1 },
-            Segment { text: "Next sentence.".to_string(), start: 1.1, end: 2.0 },
+            Segment {
+                text: "Washington, D.C".to_string(),
+                start: 0.0,
+                end: 1.0,
+            },
+            Segment {
+                text: ".".to_string(),
+                start: 1.0,
+                end: 1.1,
+            },
+            Segment {
+                text: "Next sentence.".to_string(),
+                start: 1.1,
+                end: 2.0,
+            },
         ];
         merge_orphaned_punctuation(&mut segments);
         assert_eq!(segments.len(), 2);
