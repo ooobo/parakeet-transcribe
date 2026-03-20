@@ -573,10 +573,6 @@ fn load_audio_from_stream(
 }
 
 fn resample_audio(samples: &[f32], source_rate: u32, target_rate: u32) -> Result<Vec<f32>> {
-    if source_rate == target_rate {
-        return Ok(samples.to_vec());
-    }
-
     let chunk_size = 4096;
     let mut resampler =
         FftFixedIn::<f32>::new(source_rate as usize, target_rate as usize, chunk_size, 2, 1)
@@ -846,8 +842,8 @@ fn assign_speakers(
             speaker_segments
                 .iter()
                 .filter_map(|s| {
-                    let s_start = s.start as f32 / 16_000.0;
-                    let s_end = s.end as f32 / 16_000.0;
+                    let s_start = s.start as f32 / SAMPLE_RATE as f32;
+                    let s_end = s.end as f32 / SAMPLE_RATE as f32;
                     let overlap_start = seg.start.max(s_start);
                     let overlap_end = seg.end.min(s_end);
                     let overlap = (overlap_end - overlap_start).max(0.0);
@@ -920,7 +916,7 @@ fn run(args: &ResolvedArgs) -> Result<()> {
 
     let debug = args.debug;
 
-    let filename = Path::new(&args.audio_file)
+    let filename = audio_path
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| args.audio_file.clone());
@@ -1058,59 +1054,55 @@ fn run(args: &ResolvedArgs) -> Result<()> {
         (None, segs)
     };
 
-    // For short files the callback isn't invoked, so finalize and output here
+    // For short files the streaming callback isn't invoked, so finalize and output here
     let was_chunked = duration > args.chunk_duration;
+    if !was_chunked {
+        finalize_segments(&mut segments);
+    }
 
-    if !was_chunked || args.diarize {
-        if !was_chunked {
-            finalize_segments(&mut segments);
+    if args.diarize {
+        let speaker_segs = speaker_segments.as_ref().unwrap();
+        let speakers = assign_speakers(&segments, speaker_segs);
+        let turns = group_by_speaker(&segments, &speakers);
+
+        let lines: Vec<String> = turns
+            .iter()
+            .map(|t| {
+                if use_timestamps {
+                    format!("{} - {}", format_timestamp(t.start), t.text)
+                } else {
+                    format!("- {}", t.text)
+                }
+            })
+            .collect();
+
+        eprintln!();
+        eprintln!("{}", separator);
+        for line in &lines {
+            println!("{}", line);
         }
+        eprintln!("{}", separator);
 
-        if args.diarize {
-            let speaker_segs = speaker_segments.as_ref().unwrap();
-            let speakers = assign_speakers(&segments, speaker_segs);
-            let turns = group_by_speaker(&segments, &speakers);
-
-            let lines: Vec<String> = turns
-                .iter()
-                .map(|t| {
-                    if use_timestamps {
-                        format!("{} - {}", format_timestamp(t.start), t.text)
-                    } else {
-                        format!("- {}", t.text)
-                    }
-                })
-                .collect();
-
-            eprintln!();
-            eprintln!("{}", separator);
-            for line in &lines {
-                println!("{}", line);
-            }
-            eprintln!("{}", separator);
-
-            let transcript = lines.join("\n");
-            copy_to_clipboard(&transcript);
-            eprint!(
-                "\nTranscribed in {:.2}s, transcript copied to clipboard.",
-                start_time.elapsed().as_secs_f32()
-            );
-        } else if args.json {
+        copy_to_clipboard(&lines.join("\n"));
+        eprint!(
+            "\nTranscribed in {:.2}s, transcript copied to clipboard.",
+            start_time.elapsed().as_secs_f32()
+        );
+    } else if args.json {
+        if !was_chunked {
             for segment in &segments {
                 println!("{}", serde_json::to_string(segment)?);
             }
             std::io::stdout().flush()?;
-        } else {
+        }
+    } else {
+        let transcript = build_transcript(&segments, use_timestamps);
+        if !was_chunked {
             eprintln!();
             eprintln!("{}", separator);
-            let transcript = build_transcript(&segments, use_timestamps);
             println!("{}", transcript);
             eprintln!("{}", separator);
         }
-    }
-
-    if !args.json && !args.diarize {
-        let transcript = build_transcript(&segments, use_timestamps);
         copy_to_clipboard(&transcript);
         eprint!(
             "\nTranscribed in {:.2}s, transcript copied to clipboard.",
