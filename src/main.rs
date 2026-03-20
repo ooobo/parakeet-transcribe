@@ -179,7 +179,6 @@ fn run_settings_wizard() -> Result<()> {
     let current = load_config();
 
     eprintln!("=== Parakeet Transcribe - Default Settings ===");
-    eprintln!("Type a number to select that option, or press Enter to keep the default.");
     eprintln!();
 
     // Model
@@ -191,7 +190,7 @@ fn run_settings_wizard() -> Result<()> {
     } else {
         "1"
     };
-    let model_choice = prompt_line(&format!("Choose model [{}]: ", current_model_num));
+    let model_choice = prompt_line(&format!("Type number to select option (default: {}) >> ", current_model_num));
     let model = match model_choice.as_str() {
         "1" => "nemo-parakeet-tdt-0.6b-v2".to_string(),
         "2" => "nemo-parakeet-tdt-0.6b-v3".to_string(),
@@ -212,7 +211,7 @@ fn run_settings_wizard() -> Result<()> {
     } else {
         "1"
     };
-    let quant_choice = prompt_line(&format!("Choose quantization [{}]: ", current_quant_num));
+    let quant_choice = prompt_line(&format!("Type number to select option (default: {}) >> ", current_quant_num));
     let quantization = match quant_choice.as_str() {
         "1" => "int8".to_string(),
         "2" => "none".to_string(),
@@ -239,7 +238,7 @@ fn run_settings_wizard() -> Result<()> {
         (true, false) => "3",
         (true, true) => "4",
     };
-    let mode_choice = prompt_line(&format!("Choose output mode [{}]: ", current_mode));
+    let mode_choice = prompt_line(&format!("Type number to select option (default: {}) >> ", current_mode));
     let (diarize, timestamps) = match mode_choice.as_str() {
         "1" => (false, false),
         "2" => (false, true),
@@ -255,7 +254,7 @@ fn run_settings_wizard() -> Result<()> {
     // Chunk duration
     eprintln!();
     let chunk_input = prompt_line(&format!(
-        "Chunk duration in seconds for long files [{}]: ",
+        "Chunk duration in seconds for long files (default: {}) >> ",
         current.chunk_duration
     ));
     let chunk_duration = if chunk_input.is_empty() {
@@ -278,7 +277,7 @@ fn run_settings_wizard() -> Result<()> {
     eprintln!("  [1] No");
     eprintln!("  [2] Yes (show verbose status messages)");
     let current_debug_num = if current.debug { "2" } else { "1" };
-    let debug_choice = prompt_line(&format!("Choose [{}]: ", current_debug_num));
+    let debug_choice = prompt_line(&format!("Type number to select option (default: {}) >> ", current_debug_num));
     let debug = match debug_choice.as_str() {
         "1" => false,
         "2" => true,
