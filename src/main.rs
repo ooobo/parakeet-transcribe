@@ -179,6 +179,7 @@ fn run_settings_wizard() -> Result<()> {
     let current = load_config();
 
     eprintln!("=== Parakeet Transcribe - Default Settings ===");
+    eprintln!("Type a number to select that option, or press Enter to keep the default.");
     eprintln!();
 
     // Model
