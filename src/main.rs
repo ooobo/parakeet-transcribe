@@ -790,6 +790,46 @@ fn transcribe_with_chunking(
 }
 
 // ------------------------------------------------------------
+// Output helpers
+// ------------------------------------------------------------
+
+fn format_timestamp(seconds: f32) -> String {
+    let m = (seconds / 60.0) as u32;
+    let s = (seconds % 60.0) as u32;
+    format!("[{:02}:{:02}]", m, s)
+}
+
+fn copy_to_clipboard(text: &str) {
+    match arboard::Clipboard::new() {
+        Ok(mut clipboard) => {
+            if let Err(e) = clipboard.set_text(text) {
+                eprintln!("Warning: could not copy to clipboard: {}", e);
+            }
+        }
+        Err(e) => {
+            eprintln!("Warning: could not access clipboard: {}", e);
+        }
+    }
+}
+
+/// Build a transcript string from segments.
+fn build_transcript(segments: &[Segment], timestamps: bool) -> String {
+    if timestamps {
+        segments
+            .iter()
+            .map(|s| format!("{} {}", format_timestamp(s.start), s.text))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        segments
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+// ------------------------------------------------------------
 // Diarization helpers
 // ------------------------------------------------------------
 
@@ -997,9 +1037,7 @@ fn run(args: &ResolvedArgs) -> Result<()> {
                         println!("{}", json);
                     }
                 } else if use_timestamps {
-                    let minutes = (seg.start / 60.0) as u32;
-                    let seconds = (seg.start % 60.0) as u32;
-                    println!("[{:02}:{:02}] {}", minutes, seconds, seg.text);
+                    println!("{} {}", format_timestamp(seg.start), seg.text);
                 } else {
                     println!("{}", seg.text);
                 }
@@ -1030,51 +1068,32 @@ fn run(args: &ResolvedArgs) -> Result<()> {
         }
 
         if args.diarize {
-            // Match speakers and group into turns
             let speaker_segs = speaker_segments.as_ref().unwrap();
             let speakers = assign_speakers(&segments, speaker_segs);
             let turns = group_by_speaker(&segments, &speakers);
 
-            eprintln!();
-            eprintln!("{}", separator);
-            for turn in &turns {
-                if use_timestamps {
-                    let minutes = (turn.start / 60.0) as u32;
-                    let seconds = (turn.start % 60.0) as u32;
-                    println!("[{}:{:02}] - {}", minutes, seconds, turn.text);
-                } else {
-                    println!("- {}", turn.text);
-                }
-            }
-
-            // Clipboard
-            let transcript = turns
+            let lines: Vec<String> = turns
                 .iter()
                 .map(|t| {
                     if use_timestamps {
-                        let minutes = (t.start / 60.0) as u32;
-                        let seconds = (t.start % 60.0) as u32;
-                        format!("[{}:{:02}] - {}", minutes, seconds, t.text)
+                        format!("{} - {}", format_timestamp(t.start), t.text)
                     } else {
                         format!("- {}", t.text)
                     }
                 })
-                .collect::<Vec<_>>()
-                .join("\n");
+                .collect();
 
-            match arboard::Clipboard::new() {
-                Ok(mut clipboard) => {
-                    if let Err(e) = clipboard.set_text(&transcript) {
-                        eprintln!("Warning: could not copy to clipboard: {}", e);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Warning: could not access clipboard: {}", e);
-                }
+            eprintln!();
+            eprintln!("{}", separator);
+            for line in &lines {
+                println!("{}", line);
             }
             eprintln!("{}", separator);
-            eprintln!(
-                "\nTranscribed in {:.2}s, transcript copied to clipboard",
+
+            let transcript = lines.join("\n");
+            copy_to_clipboard(&transcript);
+            eprint!(
+                "\nTranscribed in {:.2}s, transcript copied to clipboard.",
                 start_time.elapsed().as_secs_f32()
             );
         } else if args.json {
@@ -1082,59 +1101,18 @@ fn run(args: &ResolvedArgs) -> Result<()> {
                 println!("{}", serde_json::to_string(segment)?);
             }
             std::io::stdout().flush()?;
-        } else if args.timestamps {
-            eprintln!();
-            eprintln!("{}", separator);
-            for seg in &segments {
-                let minutes = (seg.start / 60.0) as u32;
-                let seconds = (seg.start % 60.0) as u32;
-                println!("[{:02}:{:02}] {}", minutes, seconds, seg.text);
-            }
-            eprintln!("{}", separator);
         } else {
             eprintln!();
             eprintln!("{}", separator);
-            let transcript = segments
-                .iter()
-                .map(|s| s.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
+            let transcript = build_transcript(&segments, use_timestamps);
             println!("{}", transcript);
             eprintln!("{}", separator);
         }
     }
 
     if !args.json && !args.diarize {
-        // Build full transcript for clipboard
-        let transcript = if args.timestamps {
-            segments
-                .iter()
-                .map(|s| {
-                    let minutes = (s.start / 60.0) as u32;
-                    let seconds = (s.start % 60.0) as u32;
-                    format!("[{:02}:{:02}] {}", minutes, seconds, s.text)
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            segments
-                .iter()
-                .map(|s| s.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
-
-        match arboard::Clipboard::new() {
-            Ok(mut clipboard) => {
-                if let Err(e) = clipboard.set_text(&transcript) {
-                    eprintln!("Warning: could not copy to clipboard: {}", e);
-                }
-            }
-            Err(e) => {
-                eprintln!("Warning: could not access clipboard: {}", e);
-            }
-        }
-
+        let transcript = build_transcript(&segments, use_timestamps);
+        copy_to_clipboard(&transcript);
         eprint!(
             "\nTranscribed in {:.2}s, transcript copied to clipboard.",
             start_time.elapsed().as_secs_f32()
