@@ -902,6 +902,8 @@ fn run(args: &ResolvedArgs) -> Result<()> {
 
     eprintln!("Transcribing {} of {:.0}s...", filename, duration);
 
+    let separator = "=============================================";
+
     let is_json = args.json;
     let use_timestamps = args.timestamps;
     let chunk_duration = args.chunk_duration;
@@ -984,6 +986,10 @@ fn run(args: &ResolvedArgs) -> Result<()> {
 
         status!(debug, "Transcribing...");
 
+        if !is_json {
+            eprintln!();
+            eprintln!("{}", separator);
+        }
         let mut stream_cb = |segments: &[Segment]| {
             for seg in segments {
                 if is_json {
@@ -1008,6 +1014,10 @@ fn run(args: &ResolvedArgs) -> Result<()> {
             Some(&mut stream_cb),
         )?;
 
+        if !is_json {
+            eprintln!("{}", separator);
+        }
+
         (None, segs)
     };
 
@@ -1025,6 +1035,8 @@ fn run(args: &ResolvedArgs) -> Result<()> {
             let speakers = assign_speakers(&segments, speaker_segs);
             let turns = group_by_speaker(&segments, &speakers);
 
+            eprintln!();
+            eprintln!("{}", separator);
             for turn in &turns {
                 if use_timestamps {
                     let minutes = (turn.start / 60.0) as u32;
@@ -1060,8 +1072,9 @@ fn run(args: &ResolvedArgs) -> Result<()> {
                     eprintln!("Warning: could not access clipboard: {}", e);
                 }
             }
+            eprintln!("{}", separator);
             eprintln!(
-                "Transcribed in {:.2}s, transcript copied to clipboard",
+                "\nTranscribed in {:.2}s, transcript copied to clipboard",
                 start_time.elapsed().as_secs_f32()
             );
         } else if args.json {
@@ -1070,18 +1083,24 @@ fn run(args: &ResolvedArgs) -> Result<()> {
             }
             std::io::stdout().flush()?;
         } else if args.timestamps {
+            eprintln!();
+            eprintln!("{}", separator);
             for seg in &segments {
                 let minutes = (seg.start / 60.0) as u32;
                 let seconds = (seg.start % 60.0) as u32;
                 println!("[{:02}:{:02}] {}", minutes, seconds, seg.text);
             }
+            eprintln!("{}", separator);
         } else {
+            eprintln!();
+            eprintln!("{}", separator);
             let transcript = segments
                 .iter()
                 .map(|s| s.text.as_str())
                 .collect::<Vec<_>>()
                 .join(" ");
             println!("{}", transcript);
+            eprintln!("{}", separator);
         }
     }
 
@@ -1116,8 +1135,8 @@ fn run(args: &ResolvedArgs) -> Result<()> {
             }
         }
 
-        eprintln!(
-            "Transcribed in {:.2}s, transcript copied to clipboard",
+        eprint!(
+            "\nTranscribed in {:.2}s, transcript copied to clipboard.",
             start_time.elapsed().as_secs_f32()
         );
     }
@@ -1126,7 +1145,8 @@ fn run(args: &ResolvedArgs) -> Result<()> {
 }
 
 fn wait_for_keypress() {
-    eprintln!("\nPress any key to close...");
+    eprint!(" Press any key to close...");
+    let _ = std::io::stderr().flush();
     let _ = std::io::stdin().read(&mut [0u8]);
 }
 
