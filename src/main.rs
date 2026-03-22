@@ -54,6 +54,10 @@ struct Args {
     #[arg(long)]
     timestamps: bool,
 
+    /// Include token-level timestamps in JSON output (requires --json)
+    #[arg(long)]
+    tokens: bool,
+
     /// Enable speaker diarization (text output only, not supported with --json)
     #[arg(long)]
     diarize: bool,
@@ -143,6 +147,7 @@ struct ResolvedArgs {
     quantization: String,
     json: bool,
     timestamps: bool,
+    tokens: bool,
     diarize: bool,
     debug: bool,
     completion_marker: Option<String>,
@@ -160,6 +165,7 @@ impl ResolvedArgs {
                 .unwrap_or_else(|| config.quantization.clone()),
             json: args.json,
             timestamps: args.timestamps || config.timestamps,
+            tokens: args.tokens,
             diarize: args.diarize || config.diarize,
             debug: args.debug || config.debug,
             completion_marker: args.completion_marker.clone(),
@@ -315,11 +321,20 @@ fn run_settings_wizard() -> Result<()> {
     Ok(())
 }
 
+#[derive(Serialize, Debug, Clone)]
+struct Token {
+    token: String,
+    start: f32,
+    end: f32,
+}
+
 #[derive(Serialize, Debug)]
 struct Segment {
     text: String,
     start: f32,
     end: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens: Option<Vec<Token>>,
 }
 
 // ------------------------------------------------------------
@@ -663,21 +678,84 @@ fn finalize_segments(segments: &mut Vec<Segment>) {
     }
 }
 
+/// Group raw token-level TimedTokens into sentence-level Segments,
+/// splitting on sentence-ending punctuation (`.`, `?`, `!`).
+fn group_tokens_into_sentences(
+    raw_tokens: Vec<parakeet_rs::TimedToken>,
+) -> Vec<Segment> {
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut current_tokens: Vec<Token> = Vec::new();
+    let mut sentence_text = String::new();
+    let mut sentence_start: Option<f32> = None;
+    let mut sentence_end: f32 = 0.0;
+
+    for t in raw_tokens {
+        if t.text.trim().is_empty() {
+            continue;
+        }
+        if sentence_start.is_none() {
+            sentence_start = Some(t.start);
+        }
+        sentence_text.push_str(&t.text);
+        sentence_end = t.end;
+        current_tokens.push(Token {
+            token: t.text.clone(),
+            start: t.start,
+            end: t.end,
+        });
+
+        let trimmed = t.text.trim();
+        if trimmed.ends_with('.') || trimmed.ends_with('?') || trimmed.ends_with('!') {
+            segments.push(Segment {
+                text: sentence_text.trim().to_string(),
+                start: sentence_start.unwrap_or(0.0),
+                end: sentence_end,
+                tokens: Some(current_tokens.clone()),
+            });
+            sentence_text.clear();
+            current_tokens.clear();
+            sentence_start = None;
+        }
+    }
+
+    // Flush remaining tokens as a final segment
+    if !current_tokens.is_empty() {
+        segments.push(Segment {
+            text: sentence_text.trim().to_string(),
+            start: sentence_start.unwrap_or(0.0),
+            end: sentence_end,
+            tokens: Some(current_tokens),
+        });
+    }
+
+    segments
+}
+
 fn transcribe_with_chunking(
     parakeet: &mut ParakeetTDT,
     audio_samples: Vec<f32>,
     chunk_duration: f32,
+    token_timestamps: bool,
     mut on_segments: Option<&mut dyn FnMut(&[Segment])>,
 ) -> Result<Vec<Segment>> {
     let duration = audio_samples.len() as f32 / SAMPLE_RATE as f32;
+    let ts_mode = if token_timestamps {
+        TimestampMode::Tokens
+    } else {
+        TimestampMode::Sentences
+    };
 
     if duration <= chunk_duration {
         let result = parakeet.transcribe_samples(
             audio_samples,
             SAMPLE_RATE,
             1,
-            Some(TimestampMode::Sentences),
+            Some(ts_mode),
         )?;
+
+        if token_timestamps {
+            return Ok(group_tokens_into_sentences(result.tokens));
+        }
 
         return Ok(result
             .tokens
@@ -686,6 +764,7 @@ fn transcribe_with_chunking(
                 text: t.text,
                 start: t.start,
                 end: t.end,
+                tokens: None,
             })
             .filter(|s| !s.text.trim().is_empty())
             .collect());
@@ -711,35 +790,66 @@ fn transcribe_with_chunking(
         let chunk_start_time = start as f32 / SAMPLE_RATE as f32;
 
         let result =
-            parakeet.transcribe_samples(chunk, SAMPLE_RATE, 1, Some(TimestampMode::Sentences))?;
+            parakeet.transcribe_samples(chunk, SAMPLE_RATE, 1, Some(ts_mode))?;
 
-        let mut chunk_segments: Vec<Segment> = Vec::new();
+        let mut chunk_segments: Vec<Segment> = if token_timestamps {
+            // For token mode: adjust times on raw tokens, then group into sentences
+            let adjusted_tokens: Vec<parakeet_rs::TimedToken> = result
+                .tokens
+                .into_iter()
+                .filter_map(|mut t| {
+                    t.start += chunk_start_time;
+                    t.end += chunk_start_time;
 
-        for token in result.tokens {
-            let adjusted_start = token.start + chunk_start_time;
-            let adjusted_end = token.end + chunk_start_time;
+                    // Skip tokens in overlap region that were already captured
+                    if chunk_idx > 0 {
+                        let overlap_end = chunk_start_time + OVERLAP_DURATION;
+                        if t.start < overlap_end {
+                            if let Some(last) = buffered_segments.last().or(all_segments.last()) {
+                                if t.start < last.end {
+                                    return None;
+                                }
+                            }
+                        }
+                    }
 
-            // Skip segments in overlap region that were already captured
-            if chunk_idx > 0 {
-                let overlap_end = chunk_start_time + OVERLAP_DURATION;
-                if adjusted_start < overlap_end {
-                    if let Some(last) = buffered_segments.last().or(all_segments.last()) {
-                        if adjusted_start < last.end {
-                            continue;
+                    if t.text.trim().is_empty() {
+                        return None;
+                    }
+                    Some(t)
+                })
+                .collect();
+            group_tokens_into_sentences(adjusted_tokens)
+        } else {
+            let mut segs = Vec::new();
+            for token in result.tokens {
+                let adjusted_start = token.start + chunk_start_time;
+                let adjusted_end = token.end + chunk_start_time;
+
+                // Skip segments in overlap region that were already captured
+                if chunk_idx > 0 {
+                    let overlap_end = chunk_start_time + OVERLAP_DURATION;
+                    if adjusted_start < overlap_end {
+                        if let Some(last) = buffered_segments.last().or(all_segments.last()) {
+                            if adjusted_start < last.end {
+                                continue;
+                            }
                         }
                     }
                 }
-            }
 
-            let text = token.text;
-            if !text.trim().is_empty() {
-                chunk_segments.push(Segment {
-                    text,
-                    start: adjusted_start,
-                    end: adjusted_end,
-                });
+                let text = token.text;
+                if !text.trim().is_empty() {
+                    segs.push(Segment {
+                        text,
+                        start: adjusted_start,
+                        end: adjusted_end,
+                        tokens: None,
+                    });
+                }
             }
-        }
+            segs
+        };
 
         if !buffered_segments.is_empty() {
             // Merge orphaned punctuation at the boundary: check if the first
@@ -905,6 +1015,10 @@ fn run(args: &ResolvedArgs) -> Result<()> {
         return Err(eyre::eyre!("--diarize is not supported with --json yet"));
     }
 
+    if args.tokens && !args.json {
+        return Err(eyre::eyre!("--tokens requires --json"));
+    }
+
     // Validate quantization
     let quantization = args.quantization.to_lowercase();
     if quantization != "int8" && quantization != "none" {
@@ -998,7 +1112,7 @@ fn run(args: &ResolvedArgs) -> Result<()> {
                     .wrap_err("Failed to load Parakeet TDT model")?;
 
                 status!(debug, "Transcribing...");
-                transcribe_with_chunking(&mut parakeet, audio_samples, chunk_duration, None)
+                transcribe_with_chunking(&mut parakeet, audio_samples, chunk_duration, false, None)
             });
 
             let speaker_segs = diarize_handle
@@ -1046,6 +1160,7 @@ fn run(args: &ResolvedArgs) -> Result<()> {
             &mut parakeet,
             audio_samples,
             chunk_duration,
+            args.tokens,
             Some(&mut stream_cb),
         )?;
 
@@ -1200,16 +1315,19 @@ mod tests {
                 text: "Washington, D.C".to_string(),
                 start: 0.0,
                 end: 1.0,
+                tokens: None,
             },
             Segment {
                 text: ".".to_string(),
                 start: 1.0,
                 end: 1.1,
+                tokens: None,
             },
             Segment {
                 text: "Next sentence.".to_string(),
                 start: 1.1,
                 end: 2.0,
+                tokens: None,
             },
         ];
         merge_orphaned_punctuation(&mut segments);
