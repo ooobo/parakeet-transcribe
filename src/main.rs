@@ -321,27 +321,29 @@ fn run_settings_wizard() -> Result<()> {
     Ok(())
 }
 
-mod serialize_f32_4dp {
+mod serialize_f32_2dp {
     use serde::Serializer;
 
     pub fn serialize<S: Serializer>(val: &f32, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_f64((*val as f64 * 10000.0).round() / 10000.0)
+        s.serialize_f64((*val as f64 * 100.0).round() / 100.0)
     }
 }
 
 #[derive(Serialize, Debug, Clone)]
 struct Token {
     token: String,
-    #[serde(serialize_with = "serialize_f32_4dp::serialize")]
+    #[serde(serialize_with = "serialize_f32_2dp::serialize")]
     start: f32,
-    #[serde(serialize_with = "serialize_f32_4dp::serialize")]
+    #[serde(serialize_with = "serialize_f32_2dp::serialize")]
     end: f32,
 }
 
 #[derive(Serialize, Debug)]
 struct Segment {
     text: String,
+    #[serde(serialize_with = "serialize_f32_2dp::serialize")]
     start: f32,
+    #[serde(serialize_with = "serialize_f32_2dp::serialize")]
     end: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     tokens: Option<Vec<Token>>,
