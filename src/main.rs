@@ -321,10 +321,20 @@ fn run_settings_wizard() -> Result<()> {
     Ok(())
 }
 
+mod serialize_f32_4dp {
+    use serde::Serializer;
+
+    pub fn serialize<S: Serializer>(val: &f32, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_f64((*val as f64 * 10000.0).round() / 10000.0)
+    }
+}
+
 #[derive(Serialize, Debug, Clone)]
 struct Token {
     token: String,
+    #[serde(serialize_with = "serialize_f32_4dp::serialize")]
     start: f32,
+    #[serde(serialize_with = "serialize_f32_4dp::serialize")]
     end: f32,
 }
 
