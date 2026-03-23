@@ -58,7 +58,7 @@ struct Args {
     #[arg(long)]
     tokens: bool,
 
-    /// Enable speaker diarization (text output only, not supported with --json)
+    /// Enable speaker diarization
     #[arg(long)]
     diarize: bool,
 
@@ -345,6 +345,8 @@ struct Segment {
     start: f32,
     #[serde(serialize_with = "serialize_f32_2dp::serialize")]
     end: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speaker: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tokens: Option<Vec<Token>>,
 }
@@ -722,6 +724,7 @@ fn group_tokens_into_sentences(
                 text: sentence_text.trim().to_string(),
                 start: sentence_start.unwrap_or(0.0),
                 end: sentence_end,
+                speaker: None,
                 tokens: Some(current_tokens.clone()),
             });
             sentence_text.clear();
@@ -736,6 +739,7 @@ fn group_tokens_into_sentences(
             text: sentence_text.trim().to_string(),
             start: sentence_start.unwrap_or(0.0),
             end: sentence_end,
+            speaker: None,
             tokens: Some(current_tokens),
         });
     }
@@ -776,6 +780,7 @@ fn transcribe_with_chunking(
                 text: t.text,
                 start: t.start,
                 end: t.end,
+                speaker: None,
                 tokens: None,
             })
             .filter(|s| !s.text.trim().is_empty())
@@ -856,6 +861,7 @@ fn transcribe_with_chunking(
                         text,
                         start: adjusted_start,
                         end: adjusted_end,
+                        speaker: None,
                         tokens: None,
                     });
                 }
@@ -1023,9 +1029,7 @@ fn run(args: &ResolvedArgs) -> Result<()> {
         return Err(eyre::eyre!("Audio file not found: {}", args.audio_file));
     }
 
-    if args.diarize && args.json {
-        return Err(eyre::eyre!("--diarize is not supported with --json yet"));
-    }
+
 
     if args.tokens && !args.json {
         return Err(eyre::eyre!("--tokens requires --json"));
@@ -1190,9 +1194,17 @@ fn run(args: &ResolvedArgs) -> Result<()> {
         finalize_segments(&mut segments);
     }
 
+    // Assign speaker labels to segments when diarizing
     if args.diarize {
         let speaker_segs = speaker_segments.as_ref().unwrap();
         let speakers = assign_speakers(&segments, speaker_segs);
+        for (seg, speaker) in segments.iter_mut().zip(speakers.iter()) {
+            seg.speaker = *speaker;
+        }
+    }
+
+    if args.diarize && !args.json {
+        let speakers: Vec<Option<usize>> = segments.iter().map(|s| s.speaker).collect();
         let turns = group_by_speaker(&segments, &speakers);
 
         let lines: Vec<String> = turns
@@ -1327,18 +1339,21 @@ mod tests {
                 text: "Washington, D.C".to_string(),
                 start: 0.0,
                 end: 1.0,
+                speaker: None,
                 tokens: None,
             },
             Segment {
                 text: ".".to_string(),
                 start: 1.0,
                 end: 1.1,
+                speaker: None,
                 tokens: None,
             },
             Segment {
                 text: "Next sentence.".to_string(),
                 start: 1.1,
                 end: 2.0,
+                speaker: None,
                 tokens: None,
             },
         ];
