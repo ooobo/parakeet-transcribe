@@ -155,6 +155,10 @@ struct ResolvedArgs {
 
 impl ResolvedArgs {
     fn from_args_and_config(args: &Args, config: &SavedConfig) -> Self {
+        // If the user passed any boolean flag on the CLI, ignore config
+        // booleans entirely and use only the CLI values.
+        let any_flag = args.json || args.timestamps || args.tokens || args.diarize || args.debug;
+
         Self {
             audio_file: args.audio_file.clone().unwrap_or_default(),
             model: args.model.clone().unwrap_or_else(|| config.model.clone()),
@@ -164,10 +168,10 @@ impl ResolvedArgs {
                 .clone()
                 .unwrap_or_else(|| config.quantization.clone()),
             json: args.json,
-            timestamps: args.timestamps || config.timestamps,
+            timestamps: if any_flag { args.timestamps } else { args.timestamps || config.timestamps },
             tokens: args.tokens,
-            diarize: args.diarize || config.diarize,
-            debug: args.debug || config.debug,
+            diarize: if any_flag { args.diarize } else { args.diarize || config.diarize },
+            debug: if any_flag { args.debug } else { args.debug || config.debug },
             completion_marker: args.completion_marker.clone(),
         }
     }
