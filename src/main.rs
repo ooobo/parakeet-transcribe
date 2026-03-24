@@ -1132,7 +1132,7 @@ fn run(args: &ResolvedArgs) -> Result<()> {
                     .wrap_err("Failed to load Parakeet TDT model")?;
 
                 status!(debug, "Transcribing...");
-                transcribe_with_chunking(&mut parakeet, audio_samples, chunk_duration, false, None)
+                transcribe_with_chunking(&mut parakeet, audio_samples, chunk_duration, args.tokens, None)
             });
 
             let speaker_segs = diarize_handle
