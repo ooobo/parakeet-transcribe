@@ -1237,7 +1237,9 @@ fn run(args: &ResolvedArgs) -> Result<()> {
             start_time.elapsed().as_secs_f32()
         );
     } else if args.json {
-        if !was_chunked {
+        // Diarize path doesn't stream (callback is None), so segments are
+        // always available here regardless of chunking.
+        if !was_chunked || args.diarize {
             for segment in &segments {
                 println!("{}", serde_json::to_string(segment)?);
             }
@@ -1245,7 +1247,7 @@ fn run(args: &ResolvedArgs) -> Result<()> {
         }
     } else {
         let transcript = build_transcript(&segments, use_timestamps);
-        if !was_chunked {
+        if !was_chunked || args.diarize {
             eprintln!();
             eprintln!("{}", separator);
             eprintln!();
