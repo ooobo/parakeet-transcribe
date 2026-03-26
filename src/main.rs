@@ -144,6 +144,7 @@ fn save_config(config: &SavedConfig) -> Result<()> {
 }
 
 /// Resolve effective settings: CLI args override saved config defaults.
+#[derive(Clone)]
 struct ResolvedArgs {
     audio_file: String,
     model: String,
@@ -1338,100 +1339,68 @@ fn main() {
 }
 
 fn run_benchmark(args: &Args, config: &SavedConfig) {
-    let audio_file = args.audio_file.clone().unwrap_or_default();
-    let model = args.model.clone().unwrap_or_else(|| config.model.clone());
-    let chunk_duration = args.chunk_duration.unwrap_or(config.chunk_duration);
-    let quantization = args
-        .quantization
-        .clone()
-        .unwrap_or_else(|| config.quantization.clone());
+    let base = ResolvedArgs {
+        audio_file: args.audio_file.clone().unwrap_or_default(),
+        model: args.model.clone().unwrap_or_else(|| config.model.clone()),
+        chunk_duration: args.chunk_duration.unwrap_or(config.chunk_duration),
+        quantization: args
+            .quantization
+            .clone()
+            .unwrap_or_else(|| config.quantization.clone()),
+        json: false,
+        timestamps: false,
+        tokens: false,
+        diarize: false,
+        debug: false,
+        completion_marker: None,
+        quiet: true,
+    };
 
     let runs: Vec<(&str, ResolvedArgs)> = vec![
         (
             "--timestamps",
             ResolvedArgs {
-                audio_file: audio_file.clone(),
-                model: model.clone(),
-                chunk_duration,
-                quantization: quantization.clone(),
-                json: false,
                 timestamps: true,
-                tokens: false,
-                diarize: false,
-                debug: false,
-                completion_marker: None,
-                quiet: true,
+                ..base.clone()
             },
         ),
         (
             "--diarize",
             ResolvedArgs {
-                audio_file: audio_file.clone(),
-                model: model.clone(),
-                chunk_duration,
-                quantization: quantization.clone(),
-                json: false,
-                timestamps: false,
-                tokens: false,
                 diarize: true,
-                debug: false,
-                completion_marker: None,
-                quiet: true,
+                ..base.clone()
             },
         ),
         (
             "--diarize --timestamps",
             ResolvedArgs {
-                audio_file: audio_file.clone(),
-                model: model.clone(),
-                chunk_duration,
-                quantization: quantization.clone(),
-                json: false,
-                timestamps: true,
-                tokens: false,
                 diarize: true,
-                debug: false,
-                completion_marker: None,
-                quiet: true,
+                timestamps: true,
+                ..base.clone()
             },
         ),
         (
             "--json --tokens",
             ResolvedArgs {
-                audio_file: audio_file.clone(),
-                model: model.clone(),
-                chunk_duration,
-                quantization: quantization.clone(),
                 json: true,
-                timestamps: false,
                 tokens: true,
-                diarize: false,
-                debug: false,
-                completion_marker: None,
-                quiet: true,
+                ..base.clone()
             },
         ),
         (
             "--json --tokens --diarize",
             ResolvedArgs {
-                audio_file: audio_file.clone(),
-                model: model.clone(),
-                chunk_duration,
-                quantization: quantization.clone(),
                 json: true,
-                timestamps: false,
                 tokens: true,
                 diarize: true,
-                debug: false,
-                completion_marker: None,
-                quiet: true,
+                ..base
             },
         ),
     ];
 
     eprintln!();
-    eprintln!("=== Benchmark: {} ===", audio_file);
-    eprintln!("Model: {} ({})", model, quantization);
+    eprintln!("=== Benchmark: {} ===", runs[0].1.audio_file);
+    eprintln!("Model: {} ({})", runs[0].1.model, runs[0].1.quantization);
     eprintln!();
 
     for (i, (label, resolved)) in runs.iter().enumerate() {
