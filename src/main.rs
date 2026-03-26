@@ -747,10 +747,9 @@ fn group_tokens_into_sentences(raw_tokens: Vec<parakeet_rs::TimedToken>) -> Vec<
                 start: sentence_start.unwrap_or(0.0),
                 end: sentence_end,
                 speaker: None,
-                tokens: Some(current_tokens.clone()),
+                tokens: Some(std::mem::take(&mut current_tokens)),
             });
             sentence_text.clear();
-            current_tokens.clear();
             sentence_start = None;
         }
     }
@@ -991,12 +990,12 @@ struct SpeakerTurn {
 }
 
 /// Group consecutive segments by speaker into turns.
-fn group_by_speaker(segments: &[Segment], speakers: &[Option<usize>]) -> Vec<SpeakerTurn> {
+fn group_by_speaker(segments: &[Segment]) -> Vec<SpeakerTurn> {
     let mut turns: Vec<SpeakerTurn> = Vec::new();
     let mut last_speaker: Option<usize> = None;
 
-    for (seg, speaker) in segments.iter().zip(speakers.iter()) {
-        if *speaker == last_speaker && speaker.is_some() {
+    for seg in segments {
+        if seg.speaker == last_speaker && seg.speaker.is_some() {
             if let Some(last_turn) = turns.last_mut() {
                 last_turn.text.push(' ');
                 last_turn.text.push_str(seg.text.trim());
@@ -1004,7 +1003,7 @@ fn group_by_speaker(segments: &[Segment], speakers: &[Option<usize>]) -> Vec<Spe
             }
         }
 
-        last_speaker = *speaker;
+        last_speaker = seg.speaker;
         turns.push(SpeakerTurn {
             text: seg.text.trim().to_string(),
             start: seg.start,
@@ -1212,8 +1211,7 @@ fn run(args: &ResolvedArgs) -> Result<()> {
 
     if !quiet {
         if args.diarize && !args.json {
-            let speakers: Vec<Option<usize>> = segments.iter().map(|s| s.speaker).collect();
-            let turns = group_by_speaker(&segments, &speakers);
+            let turns = group_by_speaker(&segments);
 
             let lines: Vec<String> = turns
                 .iter()
@@ -1320,24 +1318,17 @@ fn main() {
 }
 
 fn run_benchmark(args: &Args, config: &SavedConfig) {
-    let base = ResolvedArgs {
-        audio_file: args.audio_file.clone().unwrap_or_default(),
-        model: args.model.clone().unwrap_or_else(|| config.model.clone()),
-        chunk_duration: args.chunk_duration.unwrap_or(config.chunk_duration),
-        quantization: args
-            .quantization
-            .clone()
-            .unwrap_or_else(|| config.quantization.clone()),
-        json: false,
-        timestamps: false,
-        tokens: false,
-        diarize: false,
-        debug: false,
-        completion_marker: None,
-        quiet: true,
-    };
+    let mut base = ResolvedArgs::from_args_and_config(args, config);
+    base.json = false;
+    base.timestamps = false;
+    base.tokens = false;
+    base.diarize = false;
+    base.debug = false;
+    base.completion_marker = None;
+    base.quiet = true;
 
     let runs: Vec<(&str, ResolvedArgs)> = vec![
+        ("(plain)", base.clone()),
         (
             "--timestamps",
             ResolvedArgs {
