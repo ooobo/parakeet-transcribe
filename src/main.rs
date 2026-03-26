@@ -1422,30 +1422,20 @@ fn run_benchmark(args: &Args, config: &SavedConfig) {
     eprintln!("Model: {} ({})", model, quantization);
     eprintln!();
 
-    let mut results: Vec<(&str, String)> = Vec::new();
-
     for (i, (label, resolved)) in runs.iter().enumerate() {
-        eprint!("Run {}/{}: {} ... ", i + 1, runs.len(), label);
+        eprint!("Run {}/{}: {:.<40} ", i + 1, runs.len(), format!("{} ", label));
         let _ = std::io::stderr().flush();
 
         let start = std::time::Instant::now();
         let result = run(resolved);
         let elapsed = start.elapsed().as_secs_f32();
 
-        let status = match result {
-            Ok(()) => format!("{:.2}s", elapsed),
-            Err(e) => format!("ERROR: {:#}", e),
+        match result {
+            Ok(()) => eprintln!("{:.2}s", elapsed),
+            Err(e) => eprintln!("ERROR: {:#}", e),
         };
-        eprintln!("{}", status);
-        results.push((label, status));
     }
 
-    eprintln!();
-    eprintln!("=== Results ===");
-    eprintln!();
-    for (i, (label, status)) in results.iter().enumerate() {
-        eprintln!("  Run {}: {:.<40} {}", i + 1, format!("{} ", label), status);
-    }
     eprintln!();
 }
 
