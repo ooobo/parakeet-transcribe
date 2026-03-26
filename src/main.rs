@@ -825,64 +825,45 @@ fn transcribe_with_chunking(
 
         let result = parakeet.transcribe_samples(chunk, SAMPLE_RATE, 1, Some(ts_mode))?;
 
-        let mut chunk_segments: Vec<Segment> = if token_timestamps {
-            // For token mode: adjust times on raw tokens, then group into sentences
-            let adjusted_tokens: Vec<parakeet_rs::TimedToken> = result
-                .tokens
-                .into_iter()
-                .filter_map(|mut t| {
-                    t.start += chunk_start_time;
-                    t.end += chunk_start_time;
+        // Adjust timestamps and skip overlap/empty tokens (shared by both paths)
+        let adjusted_tokens: Vec<parakeet_rs::TimedToken> = result
+            .tokens
+            .into_iter()
+            .filter_map(|mut t| {
+                t.start += chunk_start_time;
+                t.end += chunk_start_time;
 
-                    // Skip tokens in overlap region that were already captured
-                    if chunk_idx > 0 {
-                        let overlap_end = chunk_start_time + OVERLAP_DURATION;
-                        if t.start < overlap_end {
-                            if let Some(last) = buffered_segments.last().or(all_segments.last()) {
-                                if t.start < last.end {
-                                    return None;
-                                }
-                            }
-                        }
-                    }
-
-                    if t.text.trim().is_empty() {
-                        return None;
-                    }
-                    Some(t)
-                })
-                .collect();
-            group_tokens_into_sentences(adjusted_tokens)
-        } else {
-            let mut segs = Vec::new();
-            for token in result.tokens {
-                let adjusted_start = token.start + chunk_start_time;
-                let adjusted_end = token.end + chunk_start_time;
-
-                // Skip segments in overlap region that were already captured
                 if chunk_idx > 0 {
                     let overlap_end = chunk_start_time + OVERLAP_DURATION;
-                    if adjusted_start < overlap_end {
+                    if t.start < overlap_end {
                         if let Some(last) = buffered_segments.last().or(all_segments.last()) {
-                            if adjusted_start < last.end {
-                                continue;
+                            if t.start < last.end {
+                                return None;
                             }
                         }
                     }
                 }
 
-                let text = token.text;
-                if !text.trim().is_empty() {
-                    segs.push(Segment {
-                        text,
-                        start: adjusted_start,
-                        end: adjusted_end,
-                        speaker: None,
-                        tokens: None,
-                    });
+                if t.text.trim().is_empty() {
+                    return None;
                 }
-            }
-            segs
+                Some(t)
+            })
+            .collect();
+
+        let mut chunk_segments: Vec<Segment> = if token_timestamps {
+            group_tokens_into_sentences(adjusted_tokens)
+        } else {
+            adjusted_tokens
+                .into_iter()
+                .map(|t| Segment {
+                    text: t.text,
+                    start: t.start,
+                    end: t.end,
+                    speaker: None,
+                    tokens: None,
+                })
+                .collect()
         };
 
         if !buffered_segments.is_empty() {
