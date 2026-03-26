@@ -69,6 +69,10 @@ struct Args {
     /// File to create when transcription is complete
     #[arg(long)]
     completion_marker: Option<String>,
+
+    /// Run benchmark: transcribe with multiple flag combinations and print timings
+    #[arg(long)]
+    benchmark: bool,
 }
 
 // ------------------------------------------------------------
@@ -151,6 +155,8 @@ struct ResolvedArgs {
     diarize: bool,
     debug: bool,
     completion_marker: Option<String>,
+    /// Suppress transcript output (used during benchmark runs).
+    quiet: bool,
 }
 
 impl ResolvedArgs {
@@ -173,6 +179,7 @@ impl ResolvedArgs {
             diarize: if any_flag { args.diarize } else { args.diarize || config.diarize },
             debug: if any_flag { args.debug } else { args.debug || config.debug },
             completion_marker: args.completion_marker.clone(),
+            quiet: false,
         }
     }
 }
@@ -1081,6 +1088,7 @@ fn run(args: &ResolvedArgs) -> Result<()> {
     let is_json = args.json;
     let use_timestamps = args.timestamps;
     let chunk_duration = args.chunk_duration;
+    let quiet = args.quiet;
 
     let total_threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -1162,6 +1170,7 @@ fn run(args: &ResolvedArgs) -> Result<()> {
             eprintln!();
         }
         let mut stream_cb = |segments: &[Segment]| {
+            if quiet { return; }
             for seg in segments {
                 if is_json {
                     if let Ok(json) = serde_json::to_string(seg) {
@@ -1207,59 +1216,61 @@ fn run(args: &ResolvedArgs) -> Result<()> {
         }
     }
 
-    if args.diarize && !args.json {
-        let speakers: Vec<Option<usize>> = segments.iter().map(|s| s.speaker).collect();
-        let turns = group_by_speaker(&segments, &speakers);
+    if !quiet {
+        if args.diarize && !args.json {
+            let speakers: Vec<Option<usize>> = segments.iter().map(|s| s.speaker).collect();
+            let turns = group_by_speaker(&segments, &speakers);
 
-        let lines: Vec<String> = turns
-            .iter()
-            .map(|t| {
-                if use_timestamps {
-                    format!("{} - {}", format_timestamp(t.start), t.text)
-                } else {
-                    format!("- {}", t.text)
-                }
-            })
-            .collect();
+            let lines: Vec<String> = turns
+                .iter()
+                .map(|t| {
+                    if use_timestamps {
+                        format!("{} - {}", format_timestamp(t.start), t.text)
+                    } else {
+                        format!("- {}", t.text)
+                    }
+                })
+                .collect();
 
-        eprintln!();
-        eprintln!("{}", separator);
-        eprintln!();
-        for line in &lines {
-            println!("{}", line);
-        }
-        eprintln!();
-        eprintln!("{}", separator);
-
-        copy_to_clipboard(&lines.join("\n"));
-        eprint!(
-            "\nTranscribed in {:.2}s, transcript copied to clipboard.",
-            start_time.elapsed().as_secs_f32()
-        );
-    } else if args.json {
-        // Diarize path doesn't stream (callback is None), so segments are
-        // always available here regardless of chunking.
-        if !was_chunked || args.diarize {
-            for segment in &segments {
-                println!("{}", serde_json::to_string(segment)?);
+            eprintln!();
+            eprintln!("{}", separator);
+            eprintln!();
+            for line in &lines {
+                println!("{}", line);
             }
-            std::io::stdout().flush()?;
-        }
-    } else {
-        let transcript = build_transcript(&segments, use_timestamps);
-        if !was_chunked || args.diarize {
             eprintln!();
             eprintln!("{}", separator);
-            eprintln!();
-            println!("{}", transcript);
-            eprintln!();
-            eprintln!("{}", separator);
+
+            copy_to_clipboard(&lines.join("\n"));
+            eprint!(
+                "\nTranscribed in {:.2}s, transcript copied to clipboard.",
+                start_time.elapsed().as_secs_f32()
+            );
+        } else if args.json {
+            // Diarize path doesn't stream (callback is None), so segments are
+            // always available here regardless of chunking.
+            if !was_chunked || args.diarize {
+                for segment in &segments {
+                    println!("{}", serde_json::to_string(segment)?);
+                }
+                std::io::stdout().flush()?;
+            }
+        } else {
+            let transcript = build_transcript(&segments, use_timestamps);
+            if !was_chunked || args.diarize {
+                eprintln!();
+                eprintln!("{}", separator);
+                eprintln!();
+                println!("{}", transcript);
+                eprintln!();
+                eprintln!("{}", separator);
+            }
+            copy_to_clipboard(&transcript);
+            eprint!(
+                "\nTranscribed in {:.2}s, transcript copied to clipboard.",
+                start_time.elapsed().as_secs_f32()
+            );
         }
-        copy_to_clipboard(&transcript);
-        eprint!(
-            "\nTranscribed in {:.2}s, transcript copied to clipboard.",
-            start_time.elapsed().as_secs_f32()
-        );
     }
 
     Ok(())
@@ -1284,6 +1295,12 @@ fn main() {
     }
 
     let config = load_config();
+
+    if args.benchmark {
+        run_benchmark(&args, &config);
+        return;
+    }
+
     let resolved = ResolvedArgs::from_args_and_config(&args, &config);
     let marker_path = resolved.completion_marker.clone();
     let is_json = resolved.json;
@@ -1306,6 +1323,130 @@ fn main() {
     if !is_json {
         wait_for_keypress();
     }
+}
+
+fn run_benchmark(args: &Args, config: &SavedConfig) {
+    let audio_file = args.audio_file.clone().unwrap_or_default();
+    let model = args.model.clone().unwrap_or_else(|| config.model.clone());
+    let chunk_duration = args.chunk_duration.unwrap_or(config.chunk_duration);
+    let quantization = args
+        .quantization
+        .clone()
+        .unwrap_or_else(|| config.quantization.clone());
+
+    let runs: Vec<(&str, ResolvedArgs)> = vec![
+        (
+            "--timestamps",
+            ResolvedArgs {
+                audio_file: audio_file.clone(),
+                model: model.clone(),
+                chunk_duration,
+                quantization: quantization.clone(),
+                json: false,
+                timestamps: true,
+                tokens: false,
+                diarize: false,
+                debug: false,
+                completion_marker: None,
+                quiet: true,
+            },
+        ),
+        (
+            "--diarize",
+            ResolvedArgs {
+                audio_file: audio_file.clone(),
+                model: model.clone(),
+                chunk_duration,
+                quantization: quantization.clone(),
+                json: false,
+                timestamps: false,
+                tokens: false,
+                diarize: true,
+                debug: false,
+                completion_marker: None,
+                quiet: true,
+            },
+        ),
+        (
+            "--diarize --timestamps",
+            ResolvedArgs {
+                audio_file: audio_file.clone(),
+                model: model.clone(),
+                chunk_duration,
+                quantization: quantization.clone(),
+                json: false,
+                timestamps: true,
+                tokens: false,
+                diarize: true,
+                debug: false,
+                completion_marker: None,
+                quiet: true,
+            },
+        ),
+        (
+            "--json --tokens",
+            ResolvedArgs {
+                audio_file: audio_file.clone(),
+                model: model.clone(),
+                chunk_duration,
+                quantization: quantization.clone(),
+                json: true,
+                timestamps: false,
+                tokens: true,
+                diarize: false,
+                debug: false,
+                completion_marker: None,
+                quiet: true,
+            },
+        ),
+        (
+            "--json --tokens --diarize",
+            ResolvedArgs {
+                audio_file: audio_file.clone(),
+                model: model.clone(),
+                chunk_duration,
+                quantization: quantization.clone(),
+                json: true,
+                timestamps: false,
+                tokens: true,
+                diarize: true,
+                debug: false,
+                completion_marker: None,
+                quiet: true,
+            },
+        ),
+    ];
+
+    eprintln!();
+    eprintln!("=== Benchmark: {} ===", audio_file);
+    eprintln!("Model: {} ({})", model, quantization);
+    eprintln!();
+
+    let mut results: Vec<(&str, String)> = Vec::new();
+
+    for (i, (label, resolved)) in runs.iter().enumerate() {
+        eprint!("Run {}/{}: {} ... ", i + 1, runs.len(), label);
+        let _ = std::io::stderr().flush();
+
+        let start = std::time::Instant::now();
+        let result = run(resolved);
+        let elapsed = start.elapsed().as_secs_f32();
+
+        let status = match result {
+            Ok(()) => format!("{:.2}s", elapsed),
+            Err(e) => format!("ERROR: {:#}", e),
+        };
+        eprintln!("{}", status);
+        results.push((label, status));
+    }
+
+    eprintln!();
+    eprintln!("=== Results ===");
+    eprintln!();
+    for (i, (label, status)) in results.iter().enumerate() {
+        eprintln!("  Run {}: {:.<40} {}", i + 1, format!("{} ", label), status);
+    }
+    eprintln!();
 }
 
 #[cfg(test)]
