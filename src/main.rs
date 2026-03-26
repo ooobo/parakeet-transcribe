@@ -174,10 +174,22 @@ impl ResolvedArgs {
                 .clone()
                 .unwrap_or_else(|| config.quantization.clone()),
             json: args.json,
-            timestamps: if any_flag { args.timestamps } else { args.timestamps || config.timestamps },
+            timestamps: if any_flag {
+                args.timestamps
+            } else {
+                args.timestamps || config.timestamps
+            },
             tokens: args.tokens,
-            diarize: if any_flag { args.diarize } else { args.diarize || config.diarize },
-            debug: if any_flag { args.debug } else { args.debug || config.debug },
+            diarize: if any_flag {
+                args.diarize
+            } else {
+                args.diarize || config.diarize
+            },
+            debug: if any_flag {
+                args.debug
+            } else {
+                args.debug || config.debug
+            },
             completion_marker: args.completion_marker.clone(),
             quiet: false,
         }
@@ -705,9 +717,7 @@ fn finalize_segments(segments: &mut Vec<Segment>) {
 
 /// Group raw token-level TimedTokens into sentence-level Segments,
 /// splitting on sentence-ending punctuation (`.`, `?`, `!`).
-fn group_tokens_into_sentences(
-    raw_tokens: Vec<parakeet_rs::TimedToken>,
-) -> Vec<Segment> {
+fn group_tokens_into_sentences(raw_tokens: Vec<parakeet_rs::TimedToken>) -> Vec<Segment> {
     let mut segments: Vec<Segment> = Vec::new();
     let mut current_tokens: Vec<Token> = Vec::new();
     let mut sentence_text = String::new();
@@ -773,12 +783,7 @@ fn transcribe_with_chunking(
     };
 
     if duration <= chunk_duration {
-        let result = parakeet.transcribe_samples(
-            audio_samples,
-            SAMPLE_RATE,
-            1,
-            Some(ts_mode),
-        )?;
+        let result = parakeet.transcribe_samples(audio_samples, SAMPLE_RATE, 1, Some(ts_mode))?;
 
         if token_timestamps {
             return Ok(group_tokens_into_sentences(result.tokens));
@@ -817,8 +822,7 @@ fn transcribe_with_chunking(
         let chunk: Vec<f32> = audio_samples[start..end].to_vec();
         let chunk_start_time = start as f32 / SAMPLE_RATE as f32;
 
-        let result =
-            parakeet.transcribe_samples(chunk, SAMPLE_RATE, 1, Some(ts_mode))?;
+        let result = parakeet.transcribe_samples(chunk, SAMPLE_RATE, 1, Some(ts_mode))?;
 
         let mut chunk_segments: Vec<Segment> = if token_timestamps {
             // For token mode: adjust times on raw tokens, then group into sentences
@@ -1040,8 +1044,6 @@ fn run(args: &ResolvedArgs) -> Result<()> {
         return Err(eyre::eyre!("Audio file not found: {}", args.audio_file));
     }
 
-
-
     if args.tokens && !args.json {
         return Err(eyre::eyre!("--tokens requires --json"));
     }
@@ -1081,7 +1083,9 @@ fn run(args: &ResolvedArgs) -> Result<()> {
         audio_samples.len()
     );
 
-    eprintln!("Transcribing {} of {:.0}s...", filename, duration);
+    if !args.quiet {
+        eprintln!("Transcribing {} of {:.0}s...", filename, duration);
+    }
 
     let separator = "=============================================";
 
@@ -1140,7 +1144,13 @@ fn run(args: &ResolvedArgs) -> Result<()> {
                     .wrap_err("Failed to load Parakeet TDT model")?;
 
                 status!(debug, "Transcribing...");
-                transcribe_with_chunking(&mut parakeet, audio_samples, chunk_duration, args.tokens, None)
+                transcribe_with_chunking(
+                    &mut parakeet,
+                    audio_samples,
+                    chunk_duration,
+                    args.tokens,
+                    None,
+                )
             });
 
             let speaker_segs = diarize_handle
@@ -1164,13 +1174,15 @@ fn run(args: &ResolvedArgs) -> Result<()> {
         status!(debug, "Transcribing...");
 
         let will_chunk = duration > chunk_duration;
-        if !is_json && will_chunk {
+        if !is_json && !quiet && will_chunk {
             eprintln!();
             eprintln!("{}", separator);
             eprintln!();
         }
         let mut stream_cb = |segments: &[Segment]| {
-            if quiet { return; }
+            if quiet {
+                return;
+            }
             for seg in segments {
                 if is_json {
                     if let Ok(json) = serde_json::to_string(seg) {
@@ -1193,7 +1205,7 @@ fn run(args: &ResolvedArgs) -> Result<()> {
             Some(&mut stream_cb),
         )?;
 
-        if !is_json && will_chunk {
+        if !is_json && !quiet && will_chunk {
             eprintln!();
             eprintln!("{}", separator);
         }
@@ -1423,7 +1435,12 @@ fn run_benchmark(args: &Args, config: &SavedConfig) {
     eprintln!();
 
     for (i, (label, resolved)) in runs.iter().enumerate() {
-        eprint!("Run {}/{}: {:.<40} ", i + 1, runs.len(), format!("{} ", label));
+        eprint!(
+            "Run {}/{}: {:.<40} ",
+            i + 1,
+            runs.len(),
+            format!("{} ", label)
+        );
         let _ = std::io::stderr().flush();
 
         let start = std::time::Instant::now();
